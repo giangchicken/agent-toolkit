@@ -25,6 +25,12 @@ from agent_toolkit.llm.config import (
     set_config_resolver,
 )
 from agent_toolkit.llm.factory import complete
+from agent_toolkit.llm.model_meta import (
+    count_tokens,
+    model_family,
+    supports_native_tool_calling,
+    supports_reasoning,
+)
 from agent_toolkit.llm.retry import (
     RetryPolicy,
     get_default_retry_policy,
@@ -41,9 +47,13 @@ __all__ = [
     "RetryPolicy",
     "TrafficController",
     "complete",
+    "count_tokens",
     "get_default_retry_policy",
     "get_traffic_controller",
+    "model_family",
     "resolve_config",
     "set_config_resolver",
     "set_default_retry_policy",
+    "supports_native_tool_calling",
+    "supports_reasoning",
 ]
