@@ -23,6 +23,15 @@ uv run mypy --strict src/agent_toolkit
 uv run pytest -q
 ```
 
+Two tests exercise `iter_json_array` against a real multi-hundred-megabyte JSON
+array and are skipped unless you point them at one:
+
+```bash
+AGENT_TOOLKIT_CORPUS=/path/to/array.json uv run pytest -q -k RealCorpus
+# override the expected element count if it is not 21,172:
+#   AGENT_TOOLKIT_CORPUS_COUNT=1000
+```
+
 ## Status
 
 v0.1.0 is under construction; see the plan for task order. The public surface and the deferred v0.2 backlog are documented in T11.
