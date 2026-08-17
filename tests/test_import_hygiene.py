@@ -105,6 +105,33 @@ def test_core_import_does_not_pull_the_llm_extra() -> None:
     assert _run(_CORE_IMPORT_PROBE) == "ok"
 
 
+_EXTRA_GATE_PROBE = """
+import sys
+
+# A None entry in sys.modules makes `import openai` raise ImportError, which is
+# what a core-only install looks like from inside the interpreter.
+sys.modules["openai"] = None
+
+try:
+    import agent_toolkit.llm
+except ImportError as exc:
+    assert "llm" in str(exc).lower(), f"the error does not name the extra: {exc}"
+    print("ok")
+else:
+    raise SystemExit("importing agent_toolkit.llm without openai should have failed")
+"""
+
+
+def test_the_llm_subpackage_names_its_extra_when_openai_is_missing() -> None:
+    """The other half of invariant 2: the optional half says it is optional.
+
+    A bare ``No module named 'openai'`` from inside a config module tells a
+    caller nothing about what to install. T11 checks this against a real
+    core-only wheel; this checks the gate itself.
+    """
+    assert _run(_EXTRA_GATE_PROBE) == "ok"
+
+
 # --- requirement 4: no environment read at import time -----------------------
 
 
