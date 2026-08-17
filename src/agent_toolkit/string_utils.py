@@ -26,11 +26,13 @@ from agent_toolkit.logging import get_logger
 logger = get_logger(__name__)
 
 __all__ = [
+    "THINKING_MARKERS",
     "clean_thinking_tags",
     "compute_hash",
     "extract_json_from_text",
     "normalize_text",
     "slot_filling",
+    "split_thinking",
 ]
 
 # Narrow no-break space, no-break space, thin space. Written as escapes
@@ -301,6 +303,13 @@ def clean_thinking_tags(
     ``binding`` and ``model`` are accepted and ignored. They are part of the
     signature at the harvested call sites, and keeping them is what makes the
     ``agent-evaluation`` migration an import-line change.
+
+    Frozen at the harvested behavior, which means it only removes a *well-formed*
+    ``<think>...</think>`` pair. Two shapes real models produce survive it whole:
+    a chat template that pre-fills the opening tag, so only ``</think>`` is in the
+    response, and a block cut off by ``max_tokens``, so only ``<think>`` is. Use
+    :func:`split_thinking` for those -- and for the reasoning text itself, which
+    this function discards.
     """
     if not content:
         return ""
@@ -308,3 +317,60 @@ def clean_thinking_tags(
     pattern = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
     cleaned = re.sub(pattern, "", content)
     return cleaned.strip()
+
+
+# Reasoning wrappers, in match order. Harvested from ``voice-agent-toolkit``'s
+# ``REASONING_TOKEN_PAIRS`` minus ``("<step>", "</step>")``: that is the one pair
+# a model plausibly emits *inside an answer* -- enumerating steps -- and the
+# end-token rule below would then read the whole answer up to it as reasoning.
+THINKING_MARKERS: list[tuple[str, str]] = [
+    ("<think>", "</think>"),
+    ("<reasoning>", "</reasoning>"),
+    ("<thought>", "</thought>"),
+    ("<internal>", "</internal>"),
+    ("<scratchpad>", "</scratchpad>"),
+    ("[think]", "[/think]"),
+    ("[reasoning]", "[/reasoning]"),
+    ("[thought]", "[/thought]"),
+]
+
+
+def split_thinking(text: str) -> tuple[str, str]:
+    """Split ``text`` into ``(reasoning, answer)`` on the first reasoning marker.
+
+    The rule is one line: **everything up to and including the first end marker is
+    reasoning, and everything after it is the answer.** That covers the three
+    shapes a reasoning model actually returns, including the two
+    :func:`clean_thinking_tags` misses:
+
+    - ``<think>why</think>answer`` -> ``("<think>why</think>", "answer")``
+    - ``why</think>answer`` -> the same, for a chat template that pre-filled the
+      opening tag. Most vLLM deployments of Qwen3 and DeepSeek-R1 do this, so the
+      response has no opening tag at all.
+    - ``<think>why`` (cut off by ``max_tokens``) -> ``("<think>why", "")``. An
+      empty answer is the honest result: the model never reached one.
+
+    Text with no marker comes back as ``("", text)``, so this is safe to call on
+    every response.
+
+    Markers are kept in the reasoning, matched case-insensitively, and only the
+    *first* end marker splits -- a second ``</think>`` stays in the answer, where
+    a caller can see it, rather than silently eating everything up to it.
+
+    Prose before an opening marker is counted as reasoning, because the pre-filled
+    shape above makes that case indistinguishable from reasoning that simply did
+    not open with a tag.
+    """
+    if not text:
+        return "", ""
+
+    lowered = text.lower()
+    for start, end in THINKING_MARKERS:
+        end_at = lowered.find(end)
+        if end_at != -1:
+            cut = end_at + len(end)
+            return text[:cut].strip(), text[cut:].strip()
+        start_at = lowered.find(start)
+        if start_at != -1:
+            return text[start_at:].strip(), ""
+    return "", text

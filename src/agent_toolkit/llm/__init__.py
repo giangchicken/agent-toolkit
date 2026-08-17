@@ -24,7 +24,8 @@ from agent_toolkit.llm.config import (
     resolve_config,
     set_config_resolver,
 )
-from agent_toolkit.llm.factory import complete
+from agent_toolkit.llm.executors import Completion
+from agent_toolkit.llm.factory import complete, complete_with_reasoning
 from agent_toolkit.llm.model_meta import (
     count_tokens,
     model_family,
@@ -40,6 +41,7 @@ from agent_toolkit.llm.structured import ValidationInfo, complete_structured
 from agent_toolkit.llm.traffic_control import TrafficController, get_traffic_controller
 
 __all__ = [
+    "Completion",
     "ConfigResolver",
     "DictConfigResolver",
     "EnvConfigResolver",
@@ -50,6 +52,7 @@ __all__ = [
     "ValidationInfo",
     "complete",
     "complete_structured",
+    "complete_with_reasoning",
     "count_tokens",
     "get_default_retry_policy",
     "get_traffic_controller",

@@ -41,6 +41,7 @@ from agent_toolkit.llm.exceptions import (
     LLMAuthenticationError,
     LLMConfigError,
 )
+from agent_toolkit.string_utils import extract_json_from_text
 
 BASE_URL = "https://api.test/v1"
 MODEL = "test-model"
@@ -641,30 +642,39 @@ class TestFallback:
 
 
 class TestExtraBodyMerge:
-    async def test_grammar_on_a_qwen3_model_keeps_the_thinking_switch(
+    async def test_an_explicit_thinking_switch_survives_guided_json(
         self, api: Callable[..., FakeEndpoint]
     ) -> None:
-        """Both keys, or the answer arrives somewhere nothing reads.
+        """Both keys travel in ``extra_body``, so assigning would drop one.
 
-        ``sdk_complete`` sets ``extra_body.chat_template_kwargs`` for Qwen3 to
-        keep the answer in ``content``. ``guided_json`` goes in the same place, so
-        assigning rather than merging would silently re-enable thinking.
+        ``guided_json`` and ``chat_template_kwargs`` share the same dict, and
+        ``sdk_complete`` merges rather than assigns. Whichever the caller sets
+        last, both arrive.
         """
         endpoint = api(says(json.dumps(VOTE)))
         _, info = await complete_structured(
-            "which tools?", vote_schema(CATALOG), model=QWEN_MODEL, mode="grammar"
+            "which tools?",
+            vote_schema(CATALOG),
+            model=QWEN_MODEL,
+            mode="grammar",
+            enable_thinking=False,
         )
         assert info.ok
         body = endpoint.body()
         assert body["guided_json"] == vote_schema(CATALOG)
         assert body["chat_template_kwargs"] == {"enable_thinking": False}
 
-    async def test_a_non_thinking_model_sends_only_the_guided_json(
+    async def test_nothing_turns_thinking_off_on_its_own(
         self, api: Callable[..., FakeEndpoint]
     ) -> None:
+        """The Qwen3 auto-opt-out is gone; the server's default decides.
+
+        This is the regression guard for it. A model name is not consent to
+        suppress reasoning -- reasoning is what the pipeline labels *with*.
+        """
         endpoint = api(says(json.dumps(VOTE)))
         await complete_structured(
-            "which tools?", vote_schema(CATALOG), model=MODEL, mode="grammar"
+            "which tools?", vote_schema(CATALOG), model=QWEN_MODEL, mode="grammar"
         )
         assert "chat_template_kwargs" not in endpoint.body()
 
@@ -681,6 +691,102 @@ class TestExtraBodyMerge:
         )
         assert endpoint.body()["top_k"] == 20
         assert "guided_json" in endpoint.body()
+
+
+# --- reasoning is not the answer ---------------------------------------------
+
+
+class TestReasoning:
+    async def test_a_vote_the_model_talked_itself_out_of_is_not_recorded(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        """The reason parsing reads the answer and not the whole response.
+
+        ``extract_json_from_text`` returns the *first* structure it finds. A
+        reasoning model weighing options writes JSON it then rejects, so parsing
+        the response whole would record the rejected vote -- and it would validate,
+        because both are catalog-bounded arrays.
+        """
+        api(
+            says(
+                '<think>Có thể là ["get_weather"]... không, người dùng muốn đặt lịch.'
+                '</think>["book_flight"]'
+            )
+        )
+        value, info = await complete_structured(
+            "which tools?", vote_schema(CATALOG), model=MODEL
+        )
+        assert value == ["book_flight"]
+        assert info.ok
+
+    async def test_the_reasoning_would_have_been_parsed_without_the_split(self) -> None:
+        """The control: the same text, parsed whole, yields the rejected vote."""
+        whole = (
+            '<think>Có thể là ["get_weather"]... không, người dùng muốn đặt lịch.'
+            '</think>["book_flight"]'
+        )
+        assert extract_json_from_text(whole) == ["get_weather"]
+
+    async def test_the_reasoning_is_kept_next_to_the_vote(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        """A juror record needs the argument, not just the conclusion."""
+        api(says(f"<think>Người dùng muốn đặt lịch.</think>{json.dumps(VOTE)}"))
+        value, info = await complete_structured(
+            "which tools?", vote_schema(CATALOG), model=MODEL
+        )
+        assert value == VOTE
+        assert info.reasoning == "<think>Người dùng muốn đặt lịch.</think>"
+        assert info.raw == json.dumps(VOTE)
+
+    async def test_reasoning_from_a_separate_field_is_kept_too(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            payload = _completion(json.dumps(VOTE))
+            payload["choices"][0]["message"]["reasoning_content"] = "vì cần đặt lịch"
+            return httpx2.Response(200, json=payload)
+
+        api(handler)
+        _, info = await complete_structured(
+            "which tools?", vote_schema(CATALOG), model=MODEL
+        )
+        assert info.reasoning == "vì cần đặt lịch"
+        assert info.ok
+
+    async def test_reasoning_is_empty_when_the_model_emitted_none(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        api(says(json.dumps(VOTE)))
+        _, info = await complete_structured(
+            "which tools?", vote_schema(CATALOG), model=MODEL
+        )
+        assert info.reasoning == ""
+
+    async def test_a_reasoning_block_alone_is_a_clean_abstention(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        """Cut off mid-thought: there is no vote, and the reasoning says why."""
+        api(says("<think>Tôi đang cân nhắc giữa hai tool"))
+        value, info = await complete_structured(
+            "which tools?", vote_schema(CATALOG), model=MODEL
+        )
+        assert value is None
+        assert not info.ok
+        assert info.reasoning == "<think>Tôi đang cân nhắc giữa hai tool"
+        assert info.raw == ""
+
+    async def test_thinking_can_be_switched_off_through_this_function_too(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        endpoint = api(says(json.dumps(VOTE)))
+        await complete_structured(
+            "which tools?",
+            vote_schema(CATALOG),
+            model=MODEL,
+            enable_thinking=False,
+        )
+        assert endpoint.body()["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 # --- what is checked before a request is spent -------------------------------

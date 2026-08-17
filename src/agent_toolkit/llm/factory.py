@@ -23,6 +23,12 @@ Three changes beyond that, each visible in ``tests/test_llm_complete.py``:
   policy. Five call sites in ``agent-evaluation`` pass ``max_retries=``; a
   ``TypeError`` naming the replacement is what they should meet.
 
+``complete_with_reasoning`` is the function; ``complete`` is it with the reasoning
+dropped. The harvested code had only the second, and suppressed thinking on any
+``qwen3*`` model to keep it from polluting the answer -- so reasoning was
+unavailable by construction. It is now a parameter (``enable_thinking``, unset by
+default) and a return field.
+
 ``LLMConfig.max_tokens``, ``temperature``, ``max_concurrency`` and
 ``requests_per_minute`` are read here. In the harvested code they were read by
 nobody: ``_resolve_config`` did not return them and every call site passed its
@@ -37,19 +43,19 @@ import tenacity
 from agent_toolkit.llm.config import resolve_config
 from agent_toolkit.llm.error_mapping import is_retriable, map_error
 from agent_toolkit.llm.exceptions import LLMConfigError
-from agent_toolkit.llm.executors import sdk_complete
+from agent_toolkit.llm.executors import Completion, sdk_complete
 from agent_toolkit.llm.retry import RetryPolicy, backoff, get_default_retry_policy
 from agent_toolkit.llm.traffic_control import get_traffic_controller
 from agent_toolkit.logging import get_logger
 
 logger = get_logger(__name__)
 
-__all__ = ["complete"]
+__all__ = ["complete", "complete_with_reasoning"]
 
 _REPLACED_BY_POLICY = ("max_retries", "retry_delay", "exponential_backoff")
 
 
-async def complete(
+async def complete_with_reasoning(
     prompt: str,
     system_prompt: str | None = None,
     model: str | None = None,
@@ -60,9 +66,10 @@ async def complete(
     messages: list[dict[str, object]] | None = None,
     extra_headers: dict[str, str] | None = None,
     reasoning_effort: str | None = None,
+    enable_thinking: bool | None = None,
     retry: RetryPolicy | None = None,
     **kwargs: Any,
-) -> str:
+) -> Completion:
     """Complete ``prompt`` against an OpenAI-compatible endpoint.
 
     Args:
@@ -79,13 +86,25 @@ async def complete(
         messages: A pre-built message list, used instead of ``prompt``.
         extra_headers: Merged over the resolved headers for this call only.
         reasoning_effort: Passed through when set.
+        enable_thinking: Sent as the ``enable_thinking`` chat-template kwarg when
+            set; ``True`` asks for reasoning, ``False`` suppresses it. Left
+            ``None`` -- the default -- nothing is sent and the server decides.
+            **Do not assume that default.** A self-hosted ``gemma-4-31B-it``
+            returned no reasoning at all until asked explicitly, and then returned
+            459 characters of it on the same prompt; Qwen3's template defaults the
+            other way. Sent for any model, not just the Qwen line the harvested
+            code special-cased: that endpoint accepted the kwarg for a gemma
+            model, and a server that does not know it answers 400, which is a
+            clearer outcome than silently dropping what the caller asked for.
         retry: Overrides the process-wide :class:`RetryPolicy` for this call.
         **kwargs: Extra chat-completion parameters (``temperature``,
             ``max_tokens``, ``top_p``, …). Forwarded to the provider verbatim.
 
     Returns:
-        The first choice's message content, or ``""`` if the response carries no
-        extractable text.
+        A :class:`Completion`. ``content`` is the answer with any inline
+        ``<think>`` block removed, ``""`` if the response carries no extractable
+        text; ``reasoning`` is the reasoning field or that inline block, ``""``
+        when there was none.
 
     Raises:
         LLMConfigError: No model, or the resolver could not produce a config.
@@ -139,7 +158,7 @@ async def complete(
         before_sleep=log_retry,
         reraise=True,
     )
-    async def attempt() -> str:
+    async def attempt() -> Completion:
         # The controller is entered per attempt, so a failed attempt returns its
         # concurrency slot before the retry sleeps rather than holding it for the
         # whole backoff.
@@ -154,6 +173,7 @@ async def complete(
                     messages=messages,
                     extra_headers=config.extra_headers or None,
                     reasoning_effort=config.reasoning_effort,
+                    enable_thinking=enable_thinking,
                     **kwargs,
                 )
         except LLMConfigError:
@@ -162,3 +182,44 @@ async def complete(
             raise map_error(exc, provider=config.binding) from exc
 
     return await attempt()
+
+
+async def complete(
+    prompt: str,
+    system_prompt: str | None = None,
+    model: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    api_version: str | None = None,
+    binding: str | None = None,
+    messages: list[dict[str, object]] | None = None,
+    extra_headers: dict[str, str] | None = None,
+    reasoning_effort: str | None = None,
+    enable_thinking: bool | None = None,
+    retry: RetryPolicy | None = None,
+    **kwargs: Any,
+) -> str:
+    """The answer text from :func:`complete_with_reasoning`, and nothing else.
+
+    The signature is spelled out rather than forwarded through ``*args`` because
+    the spec pins it for the ``agent-evaluation`` migration: ``str`` in, ``str``
+    out, every parameter named and type-checked at the call site. Reasoning is
+    reachable only through the sibling above, so a caller that wants it changes
+    one name and a caller that does not is unaffected.
+    """
+    completion = await complete_with_reasoning(
+        prompt,
+        system_prompt=system_prompt,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        api_version=api_version,
+        binding=binding,
+        messages=messages,
+        extra_headers=extra_headers,
+        reasoning_effort=reasoning_effort,
+        enable_thinking=enable_thinking,
+        retry=retry,
+        **kwargs,
+    )
+    return completion.content

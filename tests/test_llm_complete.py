@@ -21,7 +21,7 @@ keywords raising instead of being forwarded into the request body.
 import asyncio
 import json
 from collections.abc import Callable, Iterator
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from typing import Any
 
 import httpx2
@@ -30,10 +30,12 @@ import tenacity
 from openai import AsyncOpenAI
 
 from agent_toolkit.llm import (
+    Completion,
     DictConfigResolver,
     LLMConfig,
     RetryPolicy,
     complete,
+    complete_with_reasoning,
     get_default_retry_policy,
     get_traffic_controller,
     set_config_resolver,
@@ -44,11 +46,19 @@ from agent_toolkit.llm.exceptions import (
     LLMAuthenticationError,
     LLMRateLimitError,
 )
-from agent_toolkit.llm.executors import extract_response_content
+from agent_toolkit.llm.executors import (
+    extract_reasoning_content,
+    extract_response_content,
+)
 from agent_toolkit.llm.retry import backoff
 
 BASE_URL = "https://api.test/v1"
 MODEL = "test-model"
+
+# Qwen3 matches the pattern the harvested code used to force ``enable_thinking``
+# off for. Nothing keys on the model name any more; it is here to prove that.
+THINKING_MODEL = "qwen3-8b"
+
 REPLY = "Xin chào, tôi có thể giúp gì cho bạn?"
 
 # Two retries and no delay. The real default is eight retries five seconds
@@ -121,7 +131,12 @@ def _config(**overrides: Any) -> LLMConfig:
 
 
 def _install(**overrides: Any) -> None:
-    set_config_resolver(DictConfigResolver({MODEL: _config(**overrides)}))
+    base = _config(**overrides)
+    set_config_resolver(
+        DictConfigResolver(
+            {MODEL: base, THINKING_MODEL: replace(base, model=THINKING_MODEL)}
+        )
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -579,3 +594,179 @@ class TestDefaultPolicy:
         assert get_default_retry_policy() == mine
         set_default_retry_policy(None)
         assert get_default_retry_policy() == RetryPolicy()
+
+
+# --- thinking and reasoning --------------------------------------------------
+
+REASONING = "Người dùng chào tôi, nên tôi chào lại."
+
+
+def with_reasoning(field: str, reasoning: str, content: str = REPLY) -> Handler:
+    """A 200 whose message carries reasoning in a separate ``field``."""
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        payload = _completion(content)
+        payload["choices"][0]["message"][field] = reasoning
+        return httpx2.Response(200, json=payload)
+
+    return handler
+
+
+class TestThinkingSwitch:
+    async def test_nothing_is_sent_when_it_is_not_asked_for(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        """The regression guard for removing the automatic opt-out.
+
+        ``sdk_complete`` used to send ``enable_thinking: False`` for any ``qwen3*``
+        model. The server's default decides now.
+        """
+        endpoint = api(ok())
+        await complete(model=THINKING_MODEL, prompt="Chào bạn")
+        assert "chat_template_kwargs" not in endpoint.body()
+        assert "extra_body" not in endpoint.body()
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    async def test_an_explicit_value_is_sent(
+        self, api: Callable[..., FakeEndpoint], enabled: bool
+    ) -> None:
+        endpoint = api(ok())
+        await complete(model=MODEL, prompt="Chào bạn", enable_thinking=enabled)
+        assert endpoint.body()["chat_template_kwargs"] == {"enable_thinking": enabled}
+
+    async def test_it_is_sent_for_any_model_not_just_the_qwen_line(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        """A caller asking is the reason to send it; the model name is not.
+
+        A server that does not know the kwarg answers 400, which is a clearer
+        outcome than silently discarding what the caller asked for.
+        """
+        endpoint = api(ok())
+        await complete(model=MODEL, prompt="Chào bạn", enable_thinking=True)
+        assert endpoint.body()["chat_template_kwargs"] == {"enable_thinking": True}
+
+
+class TestReasoningFromAField:
+    @pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
+    async def test_both_spellings_are_read(
+        self, api: Callable[..., FakeEndpoint], field: str
+    ) -> None:
+        api(with_reasoning(field, REASONING))
+        result = await complete_with_reasoning(model=MODEL, prompt="Chào bạn")
+        assert result.content == REPLY
+        assert result.reasoning == REASONING
+
+    async def test_reasoning_content_wins_when_both_are_present(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            payload = _completion(REPLY)
+            payload["choices"][0]["message"]["reasoning_content"] = REASONING
+            payload["choices"][0]["message"]["reasoning"] = "the other one"
+            return httpx2.Response(200, json=payload)
+
+        api(handler)
+        result = await complete_with_reasoning(model=MODEL, prompt="Chào bạn")
+        assert result.reasoning == REASONING
+
+    async def test_no_reasoning_field_is_an_empty_string(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        api(ok())
+        result = await complete_with_reasoning(model=MODEL, prompt="Chào bạn")
+        assert result.reasoning == ""
+        assert result.content == REPLY
+
+    async def test_extract_reasoning_content_reads_a_mapping_too(self) -> None:
+        assert extract_reasoning_content({"reasoning_content": REASONING}) == REASONING
+        assert extract_reasoning_content({"content": REPLY}) == ""
+        assert extract_reasoning_content(None) == ""
+
+
+class TestReasoningInline:
+    async def test_a_think_block_is_split_off_the_answer(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        api(ok(f"<think>{REASONING}</think>{REPLY}"))
+        result = await complete_with_reasoning(model=THINKING_MODEL, prompt="Chào bạn")
+        assert result.content == REPLY
+        assert result.reasoning == f"<think>{REASONING}</think>"
+
+    async def test_a_prefilled_opening_tag_is_split_too(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        """No opening tag in the response, which is what vLLM usually returns."""
+        api(ok(f"{REASONING}</think>{REPLY}"))
+        result = await complete_with_reasoning(model=THINKING_MODEL, prompt="Chào bạn")
+        assert result.content == REPLY
+        assert result.reasoning == f"{REASONING}</think>"
+
+    async def test_a_truncated_block_leaves_the_content_empty(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        api(ok(f"<think>{REASONING}"))
+        result = await complete_with_reasoning(model=THINKING_MODEL, prompt="Chào bạn")
+        assert result.content == ""
+        assert result.reasoning == f"<think>{REASONING}"
+
+    async def test_a_field_wins_over_an_inline_block_but_content_is_still_split(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        """Some servers report the field *and* leave the block in the content.
+
+        Concatenating would duplicate the text, so the field is what gets
+        reported -- but the block still comes out of the answer.
+        """
+        api(
+            with_reasoning("reasoning_content", REASONING, f"<think>dup</think>{REPLY}")
+        )
+        result = await complete_with_reasoning(model=MODEL, prompt="Chào bạn")
+        assert result.content == REPLY
+        assert result.reasoning == REASONING
+
+
+class TestCompleteStillReturnsAString:
+    async def test_it_returns_the_answer_alone(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        """The pinned signature: ``str`` in, ``str`` out, reasoning dropped."""
+        api(ok(f"<think>{REASONING}</think>{REPLY}"))
+        result = await complete(model=THINKING_MODEL, prompt="Chào bạn")
+        assert result == REPLY
+        assert isinstance(result, str)
+
+    async def test_a_reasoning_field_does_not_leak_into_it(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        api(with_reasoning("reasoning_content", REASONING))
+        assert await complete(model=MODEL, prompt="Chào bạn") == REPLY
+
+    async def test_every_keyword_reaches_the_sibling(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        """``complete`` re-spells the signature by hand, so this checks the wiring."""
+        endpoint = api(ok())
+        await complete(
+            prompt="Chào bạn",
+            system_prompt="Bạn là trợ lý.",
+            model=MODEL,
+            enable_thinking=False,
+            retry=FAST,
+            top_p=0.25,
+        )
+        body = endpoint.body()
+        assert body["messages"][0] == {"role": "system", "content": "Bạn là trợ lý."}
+        assert body["model"] == MODEL
+        assert body["top_p"] == 0.25
+        assert body["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+class TestCompletionShape:
+    def test_reasoning_defaults_to_empty(self) -> None:
+        assert Completion(content=REPLY).reasoning == ""
+
+    def test_it_is_frozen(self) -> None:
+        completion = Completion(content=REPLY)
+        with pytest.raises(FrozenInstanceError):
+            completion.content = "other"  # type: ignore[misc]

@@ -25,6 +25,13 @@ Three strategies, tried in an order set by ``mode``:
 constraint parameters are an optimization; this module's guarantee comes from
 validating afterwards. That is what makes falling back safe.
 
+Parsing reads the *answer*, never the reasoning. That matters more than it
+sounds: a reasoning model weighing options writes JSON it then rejects, and
+``extract_json_from_text`` returns the *first* structure it finds, so parsing the
+whole response would record the vote the model talked itself out of. The reasoning
+is kept on :attr:`ValidationInfo.reasoning` instead, where a juror record can
+carry the argument alongside the vote.
+
 **Measured warning: for the jury's own schema, constrained decoding is worse
 than prompting.** The plan expects guided decoding to drive the invalid-vote rate
 toward zero. Against a self-hosted vLLM endpoint serving ``gemma-4-31B-it``, with
@@ -97,7 +104,8 @@ from jsonschema.exceptions import best_match
 from jsonschema.validators import validator_for
 
 from agent_toolkit.llm.exceptions import LLMAPIError, LLMConfigError
-from agent_toolkit.llm.factory import complete
+from agent_toolkit.llm.executors import Completion
+from agent_toolkit.llm.factory import complete_with_reasoning
 from agent_toolkit.logging import get_logger
 from agent_toolkit.string_utils import extract_json_from_text
 
@@ -148,8 +156,13 @@ class ValidationInfo:
             through ``extract_json_from_text``: fenced, prose-wrapped, trailing
             comma, or unparseable. A caller tracking model quality wants this
             separately from ``ok``.
-        raw: The response text. The only evidence of *what* failed, and
-            unrecoverable once discarded, so it is kept even on success.
+        raw: The answer text that was parsed -- reasoning already removed. The
+            only evidence of *what* failed, and unrecoverable once discarded, so
+            it is kept even on success.
+        reasoning: The model's reasoning, if it emitted any, from a ``reasoning``
+            field or an inline ``<think>`` block. ``""`` otherwise. Kept because a
+            juror's reasoning is the record that explains its vote, and it is not
+            recoverable from ``raw``.
         error: One-line reason when ``ok`` is False, else ``None``.
     """
 
@@ -157,6 +170,7 @@ class ValidationInfo:
     strategy: Strategy
     repaired: bool
     raw: str
+    reasoning: str = ""
     error: str | None = None
 
 
@@ -201,12 +215,15 @@ async def _request(
     schema: dict[str, Any],
     chain: tuple[Strategy, ...],
     kwargs: dict[str, Any],
-) -> tuple[str, Strategy]:
+) -> tuple[Completion, Strategy]:
     *fallbacks, final = chain
     for index, strategy in enumerate(fallbacks):
         call_prompt, call_kwargs = _apply(strategy, prompt, schema, kwargs)
         try:
-            return await complete(prompt=call_prompt, **call_kwargs), strategy
+            return (
+                await complete_with_reasoning(prompt=call_prompt, **call_kwargs),
+                strategy,
+            )
         except LLMAPIError as exc:
             if exc.status_code not in _UNSUPPORTED_STATUSES:
                 raise
@@ -218,7 +235,7 @@ async def _request(
                 exc.message,
             )
     call_prompt, call_kwargs = _apply(final, prompt, schema, kwargs)
-    return await complete(prompt=call_prompt, **call_kwargs), final
+    return await complete_with_reasoning(prompt=call_prompt, **call_kwargs), final
 
 
 async def complete_structured(
@@ -266,7 +283,8 @@ async def complete_structured(
     except jsonschema.SchemaError as exc:
         raise LLMConfigError(f"invalid JSON schema: {exc.message}") from exc
 
-    text, strategy = await _request(prompt, schema, chain, kwargs)
+    completion, strategy = await _request(prompt, schema, chain, kwargs)
+    text = completion.content
     value, repaired = _parse(text)
 
     if value is _MISSING:
@@ -275,6 +293,7 @@ async def complete_structured(
             strategy=strategy,
             repaired=repaired,
             raw=text,
+            reasoning=completion.reasoning,
             error="no JSON object or array in the response",
         )
 
@@ -285,9 +304,14 @@ async def complete_structured(
             strategy=strategy,
             repaired=repaired,
             raw=text,
+            reasoning=completion.reasoning,
             error=f"{failure.json_path}: {failure.message}",
         )
 
     return value, ValidationInfo(
-        ok=True, strategy=strategy, repaired=repaired, raw=text
+        ok=True,
+        strategy=strategy,
+        repaired=repaired,
+        raw=text,
+        reasoning=completion.reasoning,
     )
