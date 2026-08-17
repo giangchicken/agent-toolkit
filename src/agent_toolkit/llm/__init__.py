@@ -4,7 +4,7 @@ The gate below is what keeps the core light: importing this subpackage without
 the extra installed must say so, rather than failing later with a bare
 ``No module named 'openai'`` from three frames down.
 
-``complete`` and ``RetryPolicy`` join this surface in T8.
+``stream`` and ``complete_with_tools`` are v0.2; only ``complete`` ships in v0.1.
 """
 
 try:
@@ -24,6 +24,12 @@ from agent_toolkit.llm.config import (
     resolve_config,
     set_config_resolver,
 )
+from agent_toolkit.llm.factory import complete
+from agent_toolkit.llm.retry import (
+    RetryPolicy,
+    get_default_retry_policy,
+    set_default_retry_policy,
+)
 from agent_toolkit.llm.traffic_control import TrafficController, get_traffic_controller
 
 __all__ = [
@@ -32,8 +38,12 @@ __all__ = [
     "EnvConfigResolver",
     "JsonDirConfigResolver",
     "LLMConfig",
+    "RetryPolicy",
     "TrafficController",
+    "complete",
+    "get_default_retry_policy",
     "get_traffic_controller",
     "resolve_config",
     "set_config_resolver",
+    "set_default_retry_policy",
 ]

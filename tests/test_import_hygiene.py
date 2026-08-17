@@ -203,16 +203,42 @@ def test_the_environment_check_would_catch_a_violation() -> None:
 # --- invariant 1 and requirement 5: no host coupling -------------------------
 
 
+def _host_imports(tree: ast.Module) -> list[str]:
+    """Every import of ``src``, the harvested code's host package."""
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] == "src":
+                offenders.append(f"{node.lineno}: {ast.unparse(node)}")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] == "src":
+                    offenders.append(f"{node.lineno}: {ast.unparse(node)}")
+    return offenders
+
+
 @pytest.mark.parametrize("path", SOURCE_FILES, ids=lambda p: p.name)
 def test_no_import_from_a_host_application(path: pathlib.Path) -> None:
-    """``from src.…`` is how the harvested code reached into its host."""
-    source = path.read_text(encoding="utf-8")
-    offenders = [
-        f"{path.name}:{n}: {line.strip()}"
-        for n, line in enumerate(source.splitlines(), 1)
-        if line.lstrip().startswith(("from src.", "import src."))
-    ]
-    assert not offenders, offenders
+    """``from src.…`` is how the harvested code reached into its host.
+
+    Parsed rather than grepped, because several modules quote the host import
+    they replaced -- ``retry.py`` shows the ``from src.dependencies import
+    settings`` it exists to remove -- and a line-based check reads that
+    documentation as the violation.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    offenders = _host_imports(tree)
+    assert not offenders, f"{path.name} imports from its host: {offenders}"
+
+
+def test_the_host_import_check_would_catch_a_violation() -> None:
+    """Non-vacuous, and not fooled by a docstring that quotes the import."""
+    assert _host_imports(ast.parse("from src.dependencies import settings\n"))
+    assert _host_imports(ast.parse("import src.dependencies\n"))
+    documented = ast.parse(
+        '"""Replaced::\n\n    from src.dependencies import settings\n"""\n'
+    )
+    assert not _host_imports(documented), "the check flags a docstring"
 
 
 @pytest.mark.parametrize("path", SOURCE_FILES, ids=lambda p: p.name)

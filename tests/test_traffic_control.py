@@ -298,22 +298,22 @@ class TestEventLoopLifetime:
         """Reuse across loops is impossible because the entry does not survive.
 
         Stronger than comparing identities, which ``id()`` reuse makes
-        unreliable: the first loop's controller is proved unreachable before the
-        second loop starts, and the registry is proved not to accumulate.
+        unreliable: the first loop's controller is proved unreachable once its
+        loop is gone. The registry holds the only strong reference to it, so the
+        dead weakref is also proof the entry was dropped. Non-accumulation is
+        measured as non-growth rather than as a count of one, because other
+        tests in the session have live loops of their own in the same registry.
         """
         refs: list[weakref.ref[TrafficController]] = []
 
         async def note() -> None:
             refs.append(weakref.ref(get_traffic_controller("m")))
-            assert len(traffic_control._controllers) == 1
 
+        before = len(traffic_control._controllers)
         asyncio.run(note())
         gc.collect()
         assert refs[0]() is None, "the controller outlived its event loop"
-
-        asyncio.run(note())
-        gc.collect()
-        assert len(traffic_control._controllers) == 0
+        assert len(traffic_control._controllers) <= before, "the registry accumulated"
 
     async def test_limits_are_ignored_after_the_first_call(self) -> None:
         first = get_traffic_controller("pinned", max_concurrency=2)
