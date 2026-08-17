@@ -36,6 +36,7 @@ from agent_toolkit.llm.retry import (
     get_default_retry_policy,
     set_default_retry_policy,
 )
+from agent_toolkit.llm.structured import ValidationInfo, complete_structured
 from agent_toolkit.llm.traffic_control import TrafficController, get_traffic_controller
 
 __all__ = [
@@ -46,7 +47,9 @@ __all__ = [
     "LLMConfig",
     "RetryPolicy",
     "TrafficController",
+    "ValidationInfo",
     "complete",
+    "complete_structured",
     "count_tokens",
     "get_default_retry_policy",
     "get_traffic_controller",

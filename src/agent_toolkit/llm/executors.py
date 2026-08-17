@@ -9,6 +9,9 @@ replaced (coupling #3) and three removals:
 - ``sdk_stream`` and ``sdk_complete_with_tools``, deferred to v0.2 along with the
   ``stream`` and ``complete_with_tools`` that call them.
 
+One addition: a caller's ``extra_body`` is merged rather than assigned, so the
+Qwen thinking switch below survives a call that also passes ``guided_json``.
+
 ``extract_response_content`` comes from the same component's ``utils.py`` and
 lands here rather than in a module of its own: it exists to read one shape, the
 message object this function has just received.
@@ -173,7 +176,16 @@ async def sdk_complete(
     if _is_thinking_model(model):
         payload["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
 
+    # A caller's ``extra_body`` merges into the one above instead of replacing
+    # it. ``complete_structured(mode="grammar")`` puts ``guided_json`` there, and
+    # a plain ``update`` would drop ``enable_thinking`` on a Qwen3 model -- the
+    # answer would come back in ``reasoning``, where nothing reads it.
+    caller_extra_body = kwargs.pop("extra_body", None)
     payload.update(kwargs)
+    if caller_extra_body is not None:
+        merged: dict[str, Any] = dict(payload.get("extra_body") or {})
+        merged.update(caller_extra_body)
+        payload["extra_body"] = merged
 
     response = await client.chat.completions.create(**payload)
     choices = getattr(response, "choices", None) or []
