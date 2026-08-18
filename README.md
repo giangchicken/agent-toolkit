@@ -2,7 +2,7 @@
 
 Shared utilities for agent and dataset pipelines: string, JSON, and file helpers, plus an OpenAI-compatible LLM client with retry, rate limiting, and validated structured output.
 
-Spec: [`../docs/agent-toolkit/spec.md`](../docs/agent-toolkit/spec.md). Plan: [`../docs/agent-toolkit/plan.md`](../docs/agent-toolkit/plan.md).
+Spec: [`docs/spec.md`](docs/spec.md). Plan: [`docs/plan.md`](docs/plan.md).
 
 Two guarantees shape the design:
 
@@ -11,19 +11,67 @@ Two guarantees shape the design:
 
 ## Install
 
-```bash
-pip install agent-toolkit           # core
-pip install "agent-toolkit[llm]"    # core + LLM client
-```
-
-`agent-toolkit` is not on a registry yet, so an installed copy comes from a path or a git ref. It lives in a subdirectory of the DataForce monorepo, which both forms have to name:
+`agent-toolkit` is not published to PyPI or any registry. Install it from this repository by git ref, pinned to a tag.
 
 ```bash
-pip install "agent-toolkit[llm] @ git+https://github.com/giangchicken/DataForce.git@agent-toolkit-v0.1.0#subdirectory=agent-toolkit"
-pip install "/path/to/DataForce/agent-toolkit[llm]"     # editable: add -e
+pip install "agent-toolkit @ git+https://github.com/giangchicken/agent-toolkit.git@v0.1.0"          # core
+pip install "agent-toolkit[llm] @ git+https://github.com/giangchicken/agent-toolkit.git@v0.1.0"     # core + LLM client
 ```
 
-Python 3.11 or newer. Importing `agent_toolkit.llm` without the `llm` extra raises an `ImportError` naming the extra rather than failing later with `No module named 'openai'`.
+Python 3.11 or newer. Take the `[llm]` extra unless you only want the string, JSON, and file helpers; importing `agent_toolkit.llm` without it raises an `ImportError` naming the extra rather than failing later with `No module named 'openai'`.
+
+### Depending on it from another project
+
+Pin the tag, not a branch. `main` moves, and a resolver that sees a moving ref will happily install a different library into a rebuilt environment than the one your last run was tested against.
+
+**`pyproject.toml`** — a direct URL dependency, which is what PEP 621 gives you without a registry:
+
+```toml
+[project]
+dependencies = [
+    "agent-toolkit[llm] @ git+https://github.com/giangchicken/agent-toolkit.git@v0.1.0",
+]
+```
+
+**`requirements.txt`**:
+
+```
+agent-toolkit[llm] @ git+https://github.com/giangchicken/agent-toolkit.git@v0.1.0
+```
+
+**uv**:
+
+```bash
+uv add "agent-toolkit[llm] @ git+https://github.com/giangchicken/agent-toolkit.git@v0.1.0"
+```
+
+**Poetry** needs its own spelling, since it does not read PEP 508 direct-URL strings:
+
+```toml
+[tool.poetry.dependencies]
+agent-toolkit = { git = "https://github.com/giangchicken/agent-toolkit.git", tag = "v0.1.0", extras = ["llm"] }
+```
+
+Two things to know before you add it to a build. A git dependency needs `git` on the machine that installs it, which rules out most minimal container images and some CI runners unless you add it. And a private-repo install needs credentials at install time — a deploy key, or `git+ssh://git@github.com/...` with an agent — because pip shells out to `git` and inherits nothing else.
+
+**Local checkout**, for developing the two side by side:
+
+```bash
+pip install -e "/path/to/agent-toolkit[llm]"
+uv add --editable "/path/to/agent-toolkit[llm]"
+```
+
+### Checking the install
+
+`tests/consumer_smoke.py` calls each of the fifteen symbols a consumer imports, against whatever `agent_toolkit` is on the path. It needs no network beyond a localhost socket, because the two LLM entry points talk to a stub `http.server` it starts itself. Run it inside your own environment to confirm the dependency resolved to something that works:
+
+```bash
+git clone --depth 1 -b v0.1.0 https://github.com/giangchicken/agent-toolkit.git /tmp/at
+python -m pip install "agent-toolkit[llm] @ git+https://github.com/giangchicken/agent-toolkit.git@v0.1.0"
+python /tmp/at/tests/consumer_smoke.py
+```
+
+It prints one line per symbol and exits non-zero on the first that misbehaves. Note that it is not in the wheel — wheels carry `src/agent_toolkit` only — so it comes from a checkout or from the sdist.
 
 ## string_utils
 

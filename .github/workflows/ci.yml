@@ -1,0 +1,23 @@
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --extra llm
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy --strict src/agent_toolkit
+      - run: uv run pytest -q
+      - run: uv build
+      - name: consumer contract against the built wheel
+        run: |
+          python3.12 -m venv /tmp/at-full
+          /tmp/at-full/bin/pip install "$(echo dist/*.whl)[llm]"
+          /tmp/at-full/bin/python tests/consumer_smoke.py

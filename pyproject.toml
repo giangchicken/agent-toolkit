@@ -42,6 +42,10 @@ dev = [
 line-length = 88
 indent-width = 4
 target-version = "py311"
+# ruff formats Python blocks inside Markdown. The spec and plan quote harvested
+# code and describe a surface that includes symbols this version does not ship;
+# reformatting either would misquote the source.
+extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
