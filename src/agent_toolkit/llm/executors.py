@@ -179,6 +179,7 @@ async def sdk_complete(
     extra_headers: dict[str, str] | None = None,
     reasoning_effort: str | None = None,
     enable_thinking: bool | None = None,
+    timeout: float = 120.0,
     **kwargs: Any,
 ) -> Completion:
     """Non-streaming completion using the openai SDK.
@@ -190,6 +191,10 @@ async def sdk_complete(
     ``None``. Left alone, the server's own default decides, and that default is
     not predictable from the model name: a self-hosted ``gemma-4-31B-it`` returned
     no reasoning until asked, while Qwen3 templates default it on.
+
+    ``timeout`` is a named parameter rather than one of ``**kwargs`` because it
+    configures the client, not the request body -- left to fall through it would
+    be posted to the provider as a chat-completion parameter.
     """
 
     default_headers: dict[str, str] = {"x-session-affinity": uuid.uuid4().hex}
@@ -201,7 +206,7 @@ async def sdk_complete(
         base_url=base_url,
         default_headers=default_headers,
         max_retries=0,
-        timeout=120.0,
+        timeout=timeout,
     )
 
     max_tokens_val = int(kwargs.pop("max_tokens", 4096))

@@ -21,6 +21,7 @@ from agent_toolkit.llm.config import (
     EnvConfigResolver,
     JsonDirConfigResolver,
     LLMConfig,
+    YamlConfigResolver,
     resolve_config,
     set_config_resolver,
 )
@@ -50,6 +51,7 @@ __all__ = [
     "RetryPolicy",
     "TrafficController",
     "ValidationInfo",
+    "YamlConfigResolver",
     "complete",
     "complete_structured",
     "complete_with_reasoning",

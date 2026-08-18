@@ -29,11 +29,12 @@ dropped. The harvested code had only the second, and suppressed thinking on any
 unavailable by construction. It is now a parameter (``enable_thinking``, unset by
 default) and a return field.
 
-``LLMConfig.max_tokens``, ``temperature``, ``max_concurrency`` and
-``requests_per_minute`` are read here. In the harvested code they were read by
-nobody: ``_resolve_config`` did not return them and every call site passed its
-own. A resolver that sets them now has them honored, and a caller's explicit
-argument still wins.
+``LLMConfig.max_tokens``, ``temperature``, ``top_p``, ``timeout``,
+``enable_thinking``, ``max_concurrency`` and ``requests_per_minute`` are read
+here. In the harvested code the ones that existed were read by nobody:
+``_resolve_config`` did not return them and every call site passed its own. A
+resolver that sets them now has them honored, and a caller's explicit argument
+still wins.
 """
 
 from typing import Any
@@ -88,7 +89,8 @@ async def complete_with_reasoning(
         reasoning_effort: Passed through when set.
         enable_thinking: Sent as the ``enable_thinking`` chat-template kwarg when
             set; ``True`` asks for reasoning, ``False`` suppresses it. Left
-            ``None`` -- the default -- nothing is sent and the server decides.
+            ``None`` -- the default -- the resolved config's value is used, and
+            if that is also unset nothing is sent and the server decides.
             **Do not assume that default.** A self-hosted ``gemma-4-31B-it``
             returned no reasoning at all until asked explicitly, and then returned
             459 characters of it on the same prompt; Qwen3's template defaults the
@@ -99,6 +101,9 @@ async def complete_with_reasoning(
         retry: Overrides the process-wide :class:`RetryPolicy` for this call.
         **kwargs: Extra chat-completion parameters (``temperature``,
             ``max_tokens``, ``top_p``, …). Forwarded to the provider verbatim.
+            ``max_tokens``, ``temperature``, and ``top_p`` fall back to the
+            resolved config when not passed here; ``top_p`` is sent only when one
+            of the two supplies it, since not every endpoint accepts it.
 
     Returns:
         A :class:`Completion`. ``content`` is the answer with any inline
@@ -136,6 +141,16 @@ async def complete_with_reasoning(
 
     kwargs.setdefault("max_tokens", config.max_tokens)
     kwargs.setdefault("temperature", config.temperature)
+    # ``setdefault`` rather than passing it to ``sdk_complete`` below, because
+    # ``timeout`` is a named parameter there: passing both would be "got multiple
+    # values for keyword argument" for any caller who passes ``timeout=``, and
+    # that TypeError is raised inside the retried block, so it would be caught,
+    # mapped, and retried nine times before surfacing.
+    kwargs.setdefault("timeout", config.timeout)
+    if config.top_p is not None:
+        kwargs.setdefault("top_p", config.top_p)
+    if enable_thinking is None:
+        enable_thinking = config.enable_thinking
 
     def log_retry(retry_state: tenacity.RetryCallState) -> None:
         outcome = retry_state.outcome

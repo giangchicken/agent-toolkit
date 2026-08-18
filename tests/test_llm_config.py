@@ -7,6 +7,7 @@ leak an installed resolver into the next one.
 
 import json
 import pathlib
+import textwrap
 from collections.abc import Iterator
 
 import pytest
@@ -16,6 +17,7 @@ from agent_toolkit.llm.config import (
     EnvConfigResolver,
     JsonDirConfigResolver,
     LLMConfig,
+    YamlConfigResolver,
     resolve_config,
     set_config_resolver,
 )
@@ -313,3 +315,190 @@ def test_the_resolver_protocol_accepts_a_plain_object() -> None:
 
     set_config_resolver(HostResolver())
     assert resolve_config().api_key == "from-host"
+
+
+class TestYamlConfigResolver:
+    """One file, a ``defaults`` block, per-model overrides, and no credentials."""
+
+    def _write(self, tmp_path: pathlib.Path, text: str) -> pathlib.Path:
+        target = tmp_path / "models.yaml"
+        target.write_text(textwrap.dedent(text), encoding="utf-8")
+        return target
+
+    def test_the_three_configs_from_the_host_pipeline(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """The file this feature exists for, read back field by field."""
+        path = self._write(
+            tmp_path,
+            """
+            defaults:
+              temperature: 0.3
+              top_p: 1.0
+              max_concurrency: 10
+              requests_per_minute: 600
+              timeout: 120.0
+              max_tokens: 4096
+
+            models:
+              gemma-4-31B-it: {}
+              DeepSeek-V4-Flash:
+                enable_thinking: false
+                max_tokens: 8012
+              Qwen3.6-27B:
+                temperature: 0
+                enable_thinking: false
+            """,
+        )
+        resolver = YamlConfigResolver(path)
+
+        gemma = resolver.resolve("gemma-4-31B-it")
+        assert gemma == LLMConfig(
+            model="gemma-4-31B-it",
+            temperature=0.3,
+            top_p=1.0,
+            timeout=120.0,
+            max_tokens=4096,
+            max_concurrency=10,
+            requests_per_minute=600,
+        )
+
+        deepseek = resolver.resolve("DeepSeek-V4-Flash")
+        assert (deepseek.enable_thinking, deepseek.max_tokens) == (False, 8012)
+        assert deepseek.temperature == 0.3  # still the default
+
+        qwen = resolver.resolve("Qwen3.6-27B")
+        assert (qwen.temperature, qwen.enable_thinking) == (0, False)
+        assert qwen.max_tokens == 4096  # still the default
+
+    def test_neither_credential_nor_endpoint_is_read_from_the_file(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = self._write(tmp_path, "models:\n  m: {}\n")
+        config = YamlConfigResolver(path).resolve("m")
+        assert (config.api_key, config.base_url) == ("", None)
+
+    @pytest.mark.parametrize(
+        ("key", "value"), [("api_key", "sk-committed"), ("base_url", "https://p/v1")]
+    )
+    def test_a_caller_supplied_setting_in_a_model_block_is_refused(
+        self, tmp_path: pathlib.Path, key: str, value: str
+    ) -> None:
+        """Silently using a committed secret or endpoint, or silently ignoring one,
+        are both worse than saying so at load time."""
+        path = self._write(tmp_path, f"models:\n  m:\n    {key}: {value}\n")
+        with pytest.raises(LLMConfigError, match=f"sets '{key}'"):
+            YamlConfigResolver(path)
+
+    @pytest.mark.parametrize(
+        ("key", "value"), [("api_key", "sk-committed"), ("base_url", "https://p/v1")]
+    )
+    def test_a_caller_supplied_setting_in_the_defaults_block_is_refused(
+        self, tmp_path: pathlib.Path, key: str, value: str
+    ) -> None:
+        path = self._write(
+            tmp_path, f"defaults:\n  {key}: {value}\nmodels:\n  m: {{}}\n"
+        )
+        with pytest.raises(LLMConfigError, match=f"sets '{key}'"):
+            YamlConfigResolver(path)
+
+    def test_the_call_site_supplies_the_key_and_the_endpoint(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """How a YAML-configured run reaches a provider: the arguments, as always."""
+        path = self._write(
+            tmp_path, "defaults:\n  temperature: 0.3\nmodels:\n  m: {}\n"
+        )
+        set_config_resolver(YamlConfigResolver(path))
+        config = resolve_config(
+            model="m", api_key="sk-from-the-host", base_url="https://p.invalid/v1"
+        )
+        assert (config.api_key, config.base_url, config.temperature) == (
+            "sk-from-the-host",
+            "https://p.invalid/v1",
+            0.3,
+        )
+
+    def test_a_misspelled_setting_raises_instead_of_being_ignored(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """The whole point: a typo must not silently leave every call on the default."""
+        path = self._write(tmp_path, "models:\n  m:\n    temperatur: 0\n")
+        with pytest.raises(LLMConfigError, match="unknown setting"):
+            YamlConfigResolver(path)
+
+    def test_a_misspelled_default_names_the_defaults_block(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = self._write(tmp_path, "defaults:\n  top-p: 1.0\nmodels:\n  m: {}\n")
+        with pytest.raises(LLMConfigError, match="defaults has unknown setting"):
+            YamlConfigResolver(path)
+
+    def test_the_error_names_the_settable_keys(self, tmp_path: pathlib.Path) -> None:
+        path = self._write(tmp_path, "models:\n  m:\n    nonsense: 1\n")
+        with pytest.raises(LLMConfigError, match="top_p"):
+            YamlConfigResolver(path)
+
+    def test_a_typo_in_a_later_model_is_caught_at_load_not_at_the_call(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = self._write(
+            tmp_path, "models:\n  first: {}\n  second:\n    max_token: 8\n"
+        )
+        with pytest.raises(LLMConfigError, match="model 'second'"):
+            YamlConfigResolver(path)
+
+    def test_the_model_recorded_in_the_block_wins_over_the_key(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """So a short local alias can still send the provider's real name."""
+        path = self._write(tmp_path, "models:\n  fast:\n    model: DeepSeek-V4-Flash\n")
+        assert YamlConfigResolver(path).resolve("fast").model == "DeepSeek-V4-Flash"
+
+    def test_an_unknown_model_names_the_known_ones(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = self._write(tmp_path, "models:\n  a: {}\n")
+        with pytest.raises(LLMConfigError, match="known models: \\['a'\\]"):
+            YamlConfigResolver(path).resolve("b")
+
+    def test_a_missing_model_name_is_a_config_error(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = self._write(tmp_path, "models:\n  a: {}\n")
+        with pytest.raises(LLMConfigError, match="model name is required"):
+            YamlConfigResolver(path).resolve(None)
+
+    def test_a_missing_file_is_a_config_error(self, tmp_path: pathlib.Path) -> None:
+        with pytest.raises(LLMConfigError, match="no usable LLM config"):
+            YamlConfigResolver(tmp_path / "absent.yaml")
+
+    def test_a_malformed_file_is_a_config_error(self, tmp_path: pathlib.Path) -> None:
+        path = self._write(tmp_path, "models: [unclosed\n")
+        with pytest.raises(LLMConfigError, match="no usable LLM config"):
+            YamlConfigResolver(path)
+
+    def test_a_file_without_a_models_block_is_a_config_error(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = self._write(tmp_path, "defaults:\n  temperature: 0.3\n")
+        with pytest.raises(LLMConfigError, match="no 'models' block"):
+            YamlConfigResolver(path)
+
+    def test_a_model_that_is_not_a_mapping_is_a_config_error(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = self._write(tmp_path, "models:\n  m: 0.3\n")
+        with pytest.raises(LLMConfigError, match="must be a mapping"):
+            YamlConfigResolver(path)
+
+    def test_it_works_through_the_installed_resolver(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = self._write(
+            tmp_path,
+            "defaults:\n  temperature: 0.3\n  max_tokens: 512\nmodels:\n  m: {}\n",
+        )
+        set_config_resolver(YamlConfigResolver(path))
+        config = resolve_config(model="m")
+        assert (config.temperature, config.max_tokens) == (0.3, 512)

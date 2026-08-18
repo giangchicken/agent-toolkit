@@ -14,6 +14,12 @@ What replaces it is a resolver the host supplies once at startup:
 - :class:`JsonDirConfigResolver` -- a directory of ``<model>.json`` files,
   preserving the harvested convention so ``agent-evaluation`` keeps working by
   installing one at startup.
+- :class:`YamlConfigResolver` -- one YAML file holding every model, with a
+  ``defaults`` block each model may override. This is the one to reach for when
+  the question is "what temperature does this model run at", because the answer
+  for all of them is in one file. It holds no ``api_key`` and no ``base_url``:
+  those say where a run happens and what authorizes it, which is the caller's to
+  say, not a checked-in file's.
 
 Precedence, and it is exactly two levels deep: an explicit argument to
 :func:`resolve_config` beats whatever the installed resolver returns, and the
@@ -32,7 +38,7 @@ import pathlib
 from dataclasses import dataclass, fields, replace
 from typing import Any, Protocol
 
-from agent_toolkit.file_utils import read_json
+from agent_toolkit.file_utils import read_json, read_yaml
 from agent_toolkit.llm.exceptions import LLMConfigError
 
 __all__ = [
@@ -41,6 +47,7 @@ __all__ = [
     "EnvConfigResolver",
     "JsonDirConfigResolver",
     "LLMConfig",
+    "YamlConfigResolver",
     "resolve_config",
     "set_config_resolver",
 ]
@@ -65,13 +72,22 @@ class LLMConfig:
     binding: str = "openai"
     extra_headers: dict[str, str] | None = None
     reasoning_effort: str | None = None
+    enable_thinking: bool | None = None
     max_tokens: int = 4096
     temperature: float = 0.7
+    top_p: float | None = None
+    timeout: float = 120.0
     max_concurrency: int = 20
     requests_per_minute: int = 600
 
 
 _FIELD_NAMES = frozenset(field.name for field in fields(LLMConfig))
+
+# The two the caller supplies, never the file: see :class:`YamlConfigResolver`.
+_CALLER_SUPPLIED = ("api_key", "base_url")
+
+# Everything a YAML file may set, which is everything else.
+_YAML_KEYS = _FIELD_NAMES - set(_CALLER_SUPPLIED)
 
 
 class ConfigResolver(Protocol):
@@ -153,6 +169,93 @@ class JsonDirConfigResolver:
         }
         known.setdefault("model", name)
         return LLMConfig(**known)
+
+
+class YamlConfigResolver(DictConfigResolver):
+    """Resolves against one YAML file: a ``defaults`` block, then per-model overrides.
+
+    The file answers the question a call site should not have to::
+
+        defaults:
+          temperature: 0.3
+          top_p: 1.0
+          max_concurrency: 10
+
+        models:
+          gemma-4-31B-it: {}
+          DeepSeek-V4-Flash:
+            enable_thinking: false
+            max_tokens: 8012
+
+    A model's own block wins over ``defaults``, ``defaults`` wins over the
+    :class:`LLMConfig` field defaults, and an explicit argument at the call site
+    still beats all three -- that last rule belongs to :func:`resolve_config` and
+    is unchanged. So a model listed as ``{}`` is not underspecified; it takes the
+    defaults, which is the point of writing them down once.
+
+    **No ``api_key``, and no ``base_url``.** This file says how a model behaves,
+    not where it runs or what authenticates it. Both of those are the caller's:
+    ``complete(..., api_key=..., base_url=...)``, from whatever secret store and
+    whatever environment the host has. Either key here raises rather than being
+    ignored -- a credential silently loaded from a committed file and one
+    silently ignored are both worse than being told, and an endpoint baked into
+    a checked-in file is how a staging run reaches production.
+
+    Unknown keys raise, unlike :class:`JsonDirConfigResolver`, which ignores them.
+    The difference is deliberate: this is one file naming every model for a whole
+    run, so ``temperatur: 0`` would quietly leave every call at 0.7 and nothing
+    downstream would ever say so.
+
+    The whole file is parsed and validated in the constructor, so a typo in the
+    tenth model is reported at startup rather than by the call that first needs
+    it.
+    """
+
+    def __init__(self, path: str | os.PathLike[str]) -> None:
+        raw = read_yaml(path)
+        if not isinstance(raw, dict) or not raw:
+            raise LLMConfigError(f"no usable LLM config at {path}")
+
+        defaults = raw.get("defaults") or {}
+        if not isinstance(defaults, dict):
+            raise LLMConfigError(f"{path}: 'defaults' must be a mapping")
+        _reject_unsettable(defaults, path=path, where="defaults")
+
+        models = raw.get("models")
+        if not isinstance(models, dict) or not models:
+            raise LLMConfigError(f"{path}: no 'models' block, or it is empty")
+
+        configs: dict[str, LLMConfig] = {}
+        for name, settings in models.items():
+            if settings is None:
+                settings = {}
+            if not isinstance(settings, dict):
+                raise LLMConfigError(f"{path}: model {name!r} must be a mapping")
+            _reject_unsettable(settings, path=path, where=f"model {name!r}")
+            merged: dict[str, Any] = {**defaults, **settings}
+            merged.setdefault("model", name)
+            try:
+                configs[str(name)] = LLMConfig(**merged)
+            except TypeError as exc:  # pragma: no cover - _reject_unsettable covers it
+                raise LLMConfigError(f"{path}: model {name!r}: {exc}") from exc
+
+        super().__init__(configs)
+
+
+def _reject_unsettable(settings: dict[Any, Any], *, path: Any, where: str) -> None:
+    for key in _CALLER_SUPPLIED:
+        if key in settings:
+            raise LLMConfigError(
+                f"{path}: {where} sets {key!r}; this file says how a model "
+                f"behaves, not where it runs or what authenticates it. "
+                f"Pass {key}=... to complete() or resolve_config()"
+            )
+    unknown = sorted(str(key) for key in settings if key not in _YAML_KEYS)
+    if unknown:
+        raise LLMConfigError(
+            f"{path}: {where} has unknown setting(s) {unknown}; "
+            f"settable: {sorted(_YAML_KEYS)}"
+        )
 
 
 _resolver: ConfigResolver | None = None

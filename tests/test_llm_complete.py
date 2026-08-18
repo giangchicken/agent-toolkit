@@ -495,6 +495,86 @@ class TestResolvedConfig:
             0.9,
         )
 
+    async def test_top_p_comes_from_the_config(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        _install(top_p=0.8)
+        endpoint = api(ok())
+        await complete(model=MODEL, prompt="Chào bạn")
+        assert endpoint.body()["top_p"] == 0.8
+
+    async def test_top_p_is_sent_only_when_something_sets_it(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        """Unset it stays out of the body: not every endpoint accepts the field."""
+        endpoint = api(ok())
+        await complete(model=MODEL, prompt="Chào bạn")
+        assert "top_p" not in endpoint.body()
+        await complete(model=MODEL, prompt="Chào bạn", top_p=0.5)
+        assert endpoint.body()["top_p"] == 0.5
+
+    async def test_an_explicit_top_p_wins_over_the_config(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        _install(top_p=0.8)
+        endpoint = api(ok())
+        await complete(model=MODEL, prompt="Chào bạn", top_p=0.5)
+        assert endpoint.body()["top_p"] == 0.5
+
+    async def test_enable_thinking_comes_from_the_config(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        _install(enable_thinking=False)
+        endpoint = api(ok())
+        await complete(model=MODEL, prompt="Chào bạn")
+        assert endpoint.body()["chat_template_kwargs"] == {"enable_thinking": False}
+
+    async def test_an_explicit_enable_thinking_wins_over_the_config(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        _install(enable_thinking=False)
+        endpoint = api(ok())
+        await complete(model=MODEL, prompt="Chào bạn", enable_thinking=True)
+        assert endpoint.body()["chat_template_kwargs"] == {"enable_thinking": True}
+
+    async def test_enable_thinking_is_sent_only_when_something_sets_it(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        endpoint = api(ok())
+        await complete(model=MODEL, prompt="Chào bạn")
+        assert "chat_template_kwargs" not in endpoint.body()
+
+    async def test_the_timeout_comes_from_the_config(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        """It configures the client, so it is read off the request, not the body."""
+        _install(timeout=7.0)
+        endpoint = api(ok())
+        await complete(model=MODEL, prompt="Chào bạn")
+        assert endpoint.requests[-1].extensions["timeout"]["read"] == 7.0
+        assert "timeout" not in endpoint.body()
+
+    async def test_the_default_timeout_is_the_harvested_two_minutes(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        endpoint = api(ok())
+        await complete(model=MODEL, prompt="Chào bạn")
+        assert endpoint.requests[-1].extensions["timeout"]["read"] == 120.0
+
+    async def test_an_explicit_timeout_wins_over_the_config(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        """``timeout`` is a named parameter of ``sdk_complete``, so the config's
+        value goes through ``kwargs`` rather than alongside it. Passed both ways
+        it is "got multiple values for keyword argument" -- raised inside the
+        retried block, so it would be mapped and retried nine times before a
+        caller saw the TypeError."""
+        _install(timeout=99.0)
+        endpoint = api(ok())
+        await complete(model=MODEL, prompt="Chào bạn", timeout=3.0)
+        assert endpoint.requests[-1].extensions["timeout"]["read"] == 3.0
+        assert "timeout" not in endpoint.body()
+
     async def test_extra_headers_are_merged_over_the_configured_ones(
         self, api: Callable[..., FakeEndpoint]
     ) -> None:
