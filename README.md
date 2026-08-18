@@ -136,7 +136,7 @@ answer = await complete("Xin chào", model="gemma-4-31B-it")
 
 ### Configuration
 
-Three resolvers, one installed process-wide. Explicit arguments to `complete` always win over whatever the resolver returns.
+Four resolvers, one installed process-wide. Explicit arguments to `complete` always win over whatever the resolver returns.
 
 ```python
 from pathlib import Path
@@ -144,6 +144,7 @@ from agent_toolkit.llm import (
     LLMConfig,
     DictConfigResolver,
     JsonDirConfigResolver,
+    YamlConfigResolver,
     set_config_resolver,
 )
 
@@ -165,9 +166,52 @@ set_config_resolver(
 #    "GLM-5.1" reads glm-5.1.json; a missing file raises rather than
 #    returning a blank config and failing at the request.
 set_config_resolver(JsonDirConfigResolver(Path("configs")))
+
+# 4. YamlConfigResolver — every model in one file, with shared defaults.
+set_config_resolver(YamlConfigResolver("models.yaml"))
 ```
 
-`max_tokens`, `temperature`, `max_concurrency`, and `requests_per_minute` are read off the resolved `LLMConfig`, so a resolver can set them per model.
+#### One YAML file for every model
+
+The resolver to reach for when the question is "what temperature does this model run at" — the answer for all of them is in one place, and a model that names nothing takes the defaults rather than being underspecified. See [`examples/models.yaml`](examples/models.yaml).
+
+```yaml
+defaults:
+  temperature: 0.3
+  top_p: 1.0
+  max_tokens: 4096
+  timeout: 120.0
+  max_concurrency: 10
+  requests_per_minute: 600
+
+models:
+  gemma-4-31B-it: {}          # every default as-is
+  DeepSeek-V4-Flash:
+    enable_thinking: false
+    max_tokens: 8012
+  Qwen3.6-27B:
+    temperature: 0
+    enable_thinking: false
+```
+
+```python
+set_config_resolver(YamlConfigResolver("models.yaml"))
+
+answer = await complete(
+    "Xin chào",
+    model="Qwen3.6-27B",
+    api_key=os.environ["FPT_API_KEY"],
+    base_url=os.environ["FPT_BASE_URL"],
+)
+```
+
+Settings resolve in four steps, each beating the one below it: the argument at the call site, the model's own block, the `defaults` block, the `LLMConfig` field default.
+
+**No `api_key` and no `base_url` in the file.** This file says how a model behaves, not where it runs or what authenticates it — both are the caller's to supply. Writing either one here raises rather than being quietly used or quietly ignored: a credential in a committed file is a leak, and an endpoint in one is how a staging run reaches production. Pass them at the call site, or install a `DictConfigResolver` if the host prefers to inject them once.
+
+Unknown keys raise too, at load time rather than at the first call — this is one file naming every model for a whole run, so `temperatur: 0` would otherwise leave every call at 0.7 with nothing saying so. `JsonDirConfigResolver` still ignores unknown keys, since those files predate the toolkit.
+
+`max_tokens`, `temperature`, `top_p`, `timeout`, `enable_thinking`, `max_concurrency`, and `requests_per_minute` are read off the resolved `LLMConfig`, so a resolver can set them per model. `top_p` and `enable_thinking` are sent only when something sets them; `timeout` configures the HTTP client rather than the request body.
 
 ### Structured output
 

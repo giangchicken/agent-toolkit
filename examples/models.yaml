@@ -1,0 +1,36 @@
+# Model settings for one run: what every model shares, then what each one differs by.
+#
+#   from agent_toolkit.llm import YamlConfigResolver, complete, set_config_resolver
+#
+#   set_config_resolver(YamlConfigResolver("examples/models.yaml"))
+#   await complete(
+#       "Chào bạn",
+#       model="DeepSeek-V4-Flash",
+#       api_key=os.environ["FPT_API_KEY"],
+#       base_url=os.environ["FPT_BASE_URL"],
+#   )
+#
+# No api_key and no base_url here, by design: this file says how a model behaves,
+# not where it runs or what authenticates it. Both are the caller's to supply,
+# and writing either one here raises rather than being quietly used. Anything
+# passed to complete() still wins over what is written below.
+
+defaults:
+  temperature: 0.3
+  top_p: 1.0
+  max_tokens: 4096
+  timeout: 120.0
+  max_concurrency: 10
+  requests_per_minute: 600
+
+models:
+  # Takes every default as-is.
+  gemma-4-31B-it: {}
+
+  DeepSeek-V4-Flash:
+    enable_thinking: false
+    max_tokens: 8012
+
+  Qwen3.6-27B:
+    temperature: 0
+    enable_thinking: false
