@@ -10,14 +10,17 @@ function itself; it is out of scope for v0.1.
 """
 
 import logging
+import re
 import subprocess
 import sys
 import textwrap
 
 import pytest
 
+from agent_toolkit.errors import ToolkitError
 from agent_toolkit.string_utils import (
     MAX_SLOT_FILLING_PASSES,
+    SPOKEN_PII_FORMS,
     THINKING_MARKERS,
     clean_thinking_tags,
     compute_hash,
@@ -25,6 +28,7 @@ from agent_toolkit.string_utils import (
     normalize_text,
     slot_filling,
     split_thinking,
+    spoken_pii_forms,
 )
 
 # Defined once and referenced by both the input and the expected value. The
@@ -499,3 +503,100 @@ class TestSplitThinking:
         """The case that matters for ``complete_structured``."""
         text = '<think>maybe ["a"], no</think>["b"]'
         assert split_thinking(text)[1] == '["b"]'
+
+
+class TestSpokenPiiForms:
+    """The table is data, so most of what is worth asserting is a property of it.
+
+    Every word here is pasted into a regular expression by every caller there is,
+    and nothing escapes on the caller's behalf -- a caller that escaped would
+    break the tone-stripped derivation Vietnamese needs, since ``normalize_text``
+    over a pattern is only safe while the pattern holds no syntax.
+    """
+
+    def test_the_table_is_not_empty(self) -> None:
+        """Guard against a table that grew a lookup and lost its rows."""
+        assert len(SPOKEN_PII_FORMS) >= 2
+
+    @pytest.mark.parametrize("language", sorted(SPOKEN_PII_FORMS))
+    def test_every_word_is_a_word_and_not_syntax(self, language: str) -> None:
+        """A row carrying ``.`` or ``(`` would compile -- and match text no
+        speaker produces, or swallow the rest of the pattern."""
+        forms = spoken_pii_forms(language)
+
+        for word in (*forms.digits, forms.zero, forms.at, forms.dot):
+            assert word.split(), "a blank word matches everywhere"
+            for token in word.split():
+                assert token.isalnum(), f"{token!r} is syntax, not a word"
+
+    @pytest.mark.parametrize("language", sorted(SPOKEN_PII_FORMS))
+    def test_the_zero_word_is_one_of_the_digits(self, language: str) -> None:
+        """A dictated number opens with it and continues with them, so a ``zero``
+        outside ``digits`` builds a pattern matching a first word and no run."""
+        forms = spoken_pii_forms(language)
+
+        assert forms.zero in forms.digits
+
+    @pytest.mark.parametrize("language", sorted(SPOKEN_PII_FORMS))
+    def test_the_digits_are_distinct(self, language: str) -> None:
+        """A repeated word makes the alternation longer and says nothing new."""
+        forms = spoken_pii_forms(language)
+
+        assert len(set(forms.digits)) == len(forms.digits)
+
+    def test_vietnamese_carries_the_two_word_forms(self) -> None:
+        """``mốt``, ``tư`` and ``lăm`` are why ``digits`` is a set of words and
+        not ten entries: a table indexed by value cannot hold two for one digit."""
+        digits = set(spoken_pii_forms("vi").digits)
+
+        assert {"một", "mốt"} <= digits
+        assert {"bốn", "tư"} <= digits
+        assert {"năm", "lăm"} <= digits
+
+    @pytest.mark.parametrize(
+        ("language", "dictated"),
+        [
+            ("vi", "bốn tám không hai một năm"),
+            ("en", "four eight zero two one five"),
+        ],
+    )
+    def test_a_run_of_dictated_digits_matches_through_the_table(
+        self, language: str, dictated: str
+    ) -> None:
+        """The shape is the caller's; this is the shape a caller writes, once, to
+        show that the vocabulary composes into one."""
+        run = "|".join(spoken_pii_forms(language).digits)
+
+        assert re.search(rf"(?:{run})(?:[\s.,]+(?:{run})){{5,}}", dictated)
+
+    def test_a_multi_word_mark_is_the_caller_s_to_space(self) -> None:
+        """``a còng`` is two words, stored as it is said, and a caller joins on
+        whitespace. Stored with a single space it would fail on two."""
+        assert spoken_pii_forms("vi").at == "a còng"
+        assert len(spoken_pii_forms("vi").at.split()) == 2
+        assert len(spoken_pii_forms("en").at.split()) == 1
+
+    def test_the_tone_stripped_view_is_still_words(self) -> None:
+        """Why this lives beside ``normalize_text``: the same scan runs over the
+        raw text and over a stripped view, so both spellings have to be usable."""
+        for word in spoken_pii_forms("vi").digits:
+            stripped = normalize_text(word, remove_tone_marks=True)
+            assert stripped.isalnum()
+            assert len(stripped) == len(word), "an offset has to survive stripping"
+
+    def test_a_language_nobody_wrote_down_is_refused(self) -> None:
+        """No fallback. Scanning Spanish with Vietnamese digit words finds
+        nothing, and finding nothing is indistinguishable from clean text."""
+        with pytest.raises(ToolkitError, match="es"):
+            spoken_pii_forms("es")
+
+    def test_the_refusal_names_the_languages_that_are_written_down(self) -> None:
+        """The caller's next move is to fix a name or add a row, and both need to
+        know which names exist."""
+        with pytest.raises(ToolkitError, match="vi"):
+            spoken_pii_forms("")
+
+    def test_a_row_cannot_be_edited(self) -> None:
+        """A NamedTuple, so a consumer that edited one would edit it for all."""
+        with pytest.raises(AttributeError):
+            spoken_pii_forms("vi").digits = ()  # type: ignore[misc]
