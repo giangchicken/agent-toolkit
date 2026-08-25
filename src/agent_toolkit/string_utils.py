@@ -1,4 +1,5 @@
-"""String helpers: slot filling, JSON extraction, normalization, hashing.
+"""String helpers: slot filling, JSON extraction, normalization, hashing, and
+the words a language reads personal data aloud with.
 
 ``slot_filling`` and ``extract_json_from_text`` are harvested from
 ``agent-evaluation``'s ``src/utils/string_utils.py``, which was itself a
@@ -11,27 +12,37 @@ Both extraction functions log at debug and return a fallback rather than raising
 on any input. That contract is deliberate: they parse model output, which is
 adversarial by nature, and a caller mid-pipeline should get an empty result it
 can record rather than an exception it has to catch at every call site.
+
+``spoken_pii_forms`` is here rather than in a module of its own because it is the
+other half of ``normalize_text(remove_tone_marks=True)``: a scan for a dictated
+Vietnamese phone number runs the same pattern over the raw text and over a
+tone-stripped view of it, so the words and the stripping are one concern and a
+caller reaches for both in the same breath.
 """
 
 import hashlib
 import json
 import re
 import unicodedata
-from typing import Any
+from typing import Any, NamedTuple
 
 import json_repair
 
+from agent_toolkit.errors import ToolkitError
 from agent_toolkit.logging import get_logger
 
 logger = get_logger(__name__)
 
 __all__ = [
+    "SPOKEN_PII_FORMS",
     "THINKING_MARKERS",
+    "SpokenPiiForms",
     "clean_thinking_tags",
     "compute_hash",
     "extract_json_from_text",
     "normalize_text",
     "slot_filling",
+    "spoken_pii_forms",
     "split_thinking",
 ]
 
@@ -374,3 +385,123 @@ def split_thinking(text: str) -> tuple[str, str]:
         if start_at != -1:
             return text[start_at:].strip(), ""
     return "", text
+
+
+class SpokenPiiForms(NamedTuple):
+    """The words one language reads a digit, an ``@`` and a ``.`` aloud with.
+
+    These four fields are exactly what a scan for *dictated* personal data needs
+    and nothing else, which is why the type is named for the job rather than for
+    the language: digit words find a phone number or a customer id read out loud,
+    and ``at`` and ``dot`` find an email address. ``0912345678`` looks the same in
+    every language and ``không chín một hai`` does not, so a detector for the
+    spoken form is a pattern plus a vocabulary -- and the vocabulary is the half
+    that changes.
+
+    **The patterns are the caller's.** A regular expression belongs with the tests
+    that hold it, and a library shipping the shapes too would decide what counts
+    as an identifier for every consumer.
+
+    **Only facts about a language are here.** A telephone numbering plan is not
+    one: how many digits a mobile number carries is a fact about a *country*,
+    changes when a regulator says so, and belongs with the caller that knows which
+    plan it is scanning under. ``at`` and ``dot`` do not change when Vietnam
+    renumbers.
+
+    ``digits`` is a set of words rather than ten entries indexed by value, because
+    a language may say a digit more than one way: Vietnamese has ``một``/``mốt``,
+    ``bốn``/``tư`` and ``năm``/``lăm``, English has ``zero``/``oh``. A caller
+    matching a run of dictated digits wants the alternation, and one that needed a
+    particular word's value would want a different structure than this.
+
+    ``zero`` is separate because it is the one word whose *position* matters: a
+    dictated number opens with it wherever the written form opens with a trunk
+    prefix. ``at`` and ``dot`` may be more than one word -- ``a còng`` is two --
+    so a caller building a pattern joins them on whitespace rather than embedding
+    them verbatim.
+    """
+
+    digits: tuple[str, ...]  # every word this language says a digit with
+    zero: str  # the word a dictated number opens with
+    at: str  # ``@``, read aloud
+    dot: str  # ``.``, read aloud
+
+
+# Vietnamese is measured: these are the forms a Vietnamese call-centre transcript
+# actually carries, including the three digits with two words each. English is
+# straightforward and is here so that ``language`` is a real parameter rather than
+# one entry wearing a signature -- a table with one row has never been indexed by
+# anything.
+SPOKEN_PII_FORMS: dict[str, SpokenPiiForms] = {
+    "vi": SpokenPiiForms(
+        digits=(
+            "không",
+            "một",
+            "mốt",
+            "hai",
+            "ba",
+            "bốn",
+            "tư",
+            "năm",
+            "lăm",
+            "sáu",
+            "bảy",
+            "tám",
+            "chín",
+        ),
+        zero="không",
+        at="a còng",
+        dot="chấm",
+    ),
+    "en": SpokenPiiForms(
+        digits=(
+            "zero",
+            "oh",
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "seven",
+            "eight",
+            "nine",
+        ),
+        zero="zero",
+        at="at",
+        dot="dot",
+    ),
+}
+
+
+def spoken_pii_forms(language: str) -> SpokenPiiForms:
+    """The words ``language`` reads digits and address punctuation aloud with.
+
+    Unlike the extraction functions above, this raises. A language nobody has
+    written down cannot take a fallback: scanning Spanish text with Vietnamese
+    digit words finds nothing, and finding nothing is indistinguishable from
+    finding clean text -- which is the one failure a recall-first scan cannot
+    report on its own.
+
+    Two languages are written down. A third arrives with the corpus that needs
+    it: inventing a vocabulary nobody has read aloud produces a detector that
+    looks tested and matches text no speaker of that language produces.
+
+    Args:
+        language: A key of :data:`SPOKEN_PII_FORMS`, such as ``"vi"``.
+
+    Returns:
+        The vocabulary for that language.
+
+    Raises:
+        ToolkitError: No vocabulary is written down for ``language``. The message
+            names the ones that are, because the caller's next move is either to
+            correct a configured name or to add a row.
+    """
+    if language not in SPOKEN_PII_FORMS:
+        known = ", ".join(sorted(SPOKEN_PII_FORMS))
+        raise ToolkitError(
+            f"no spoken PII forms are written down for language {language!r}; "
+            f"known: {known}"
+        )
+    return SPOKEN_PII_FORMS[language]
