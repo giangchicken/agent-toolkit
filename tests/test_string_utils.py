@@ -17,18 +17,24 @@ import textwrap
 
 import pytest
 
-from agent_toolkit.errors import ToolkitError
 from agent_toolkit.string_utils import (
     MAX_SLOT_FILLING_PASSES,
-    SPOKEN_PII_FORMS,
+    NAME_TITLES,
+    OTP_CUES,
+    SPOKEN_AT,
+    SPOKEN_DIGITS,
+    SPOKEN_DOT,
     THINKING_MARKERS,
     clean_thinking_tags,
     compute_hash,
+    email_detection_by_rules,
     extract_json_from_text,
+    name_detection_by_rules,
     normalize_text,
+    otp_detection_by_rules,
+    phone_number_detection_by_rules,
     slot_filling,
     split_thinking,
-    spoken_pii_forms,
 )
 
 # Defined once and referenced by both the input and the expected value. The
@@ -505,98 +511,242 @@ class TestSplitThinking:
         assert split_thinking(text)[1] == '["b"]'
 
 
-class TestSpokenPiiForms:
-    """The table is data, so most of what is worth asserting is a property of it.
-
-    Every word here is pasted into a regular expression by every caller there is,
-    and nothing escapes on the caller's behalf -- a caller that escaped would
-    break the tone-stripped derivation Vietnamese needs, since ``normalize_text``
-    over a pattern is only safe while the pattern holds no syntax.
-    """
-
-    def test_the_table_is_not_empty(self) -> None:
-        """Guard against a table that grew a lookup and lost its rows."""
-        assert len(SPOKEN_PII_FORMS) >= 2
-
-    @pytest.mark.parametrize("language", sorted(SPOKEN_PII_FORMS))
-    def test_every_word_is_a_word_and_not_syntax(self, language: str) -> None:
-        """A row carrying ``.`` or ``(`` would compile -- and match text no
-        speaker produces, or swallow the rest of the pattern."""
-        forms = spoken_pii_forms(language)
-
-        for word in (*forms.digits, forms.zero, forms.at, forms.dot):
-            assert word.split(), "a blank word matches everywhere"
-            for token in word.split():
-                assert token.isalnum(), f"{token!r} is syntax, not a word"
-
-    @pytest.mark.parametrize("language", sorted(SPOKEN_PII_FORMS))
-    def test_the_zero_word_is_one_of_the_digits(self, language: str) -> None:
-        """A dictated number opens with it and continues with them, so a ``zero``
-        outside ``digits`` builds a pattern matching a first word and no run."""
-        forms = spoken_pii_forms(language)
-
-        assert forms.zero in forms.digits
-
-    @pytest.mark.parametrize("language", sorted(SPOKEN_PII_FORMS))
-    def test_the_digits_are_distinct(self, language: str) -> None:
-        """A repeated word makes the alternation longer and says nothing new."""
-        forms = spoken_pii_forms(language)
-
-        assert len(set(forms.digits)) == len(forms.digits)
-
-    def test_vietnamese_carries_the_two_word_forms(self) -> None:
-        """``mốt``, ``tư`` and ``lăm`` are why ``digits`` is a set of words and
-        not ten entries: a table indexed by value cannot hold two for one digit."""
-        digits = set(spoken_pii_forms("vi").digits)
-
-        assert {"một", "mốt"} <= digits
-        assert {"bốn", "tư"} <= digits
-        assert {"năm", "lăm"} <= digits
+class TestTheVocabularyTables:
+    """The tables are data and every detector pastes one into a pattern, so what
+    is worth asserting is that they hold what a pattern needs."""
 
     @pytest.mark.parametrize(
-        ("language", "dictated"),
-        [
-            ("vi", "bốn tám không hai một năm"),
-            ("en", "four eight zero two one five"),
-        ],
+        "table", [SPOKEN_DIGITS, SPOKEN_AT, SPOKEN_DOT, NAME_TITLES, OTP_CUES]
     )
-    def test_a_run_of_dictated_digits_matches_through_the_table(
-        self, language: str, dictated: str
+    def test_every_language_is_written_down_in_every_table(
+        self, table: dict[str, str]
     ) -> None:
-        """The shape is the caller's; this is the shape a caller writes, once, to
-        show that the vocabulary composes into one."""
-        run = "|".join(spoken_pii_forms(language).digits)
+        """A language with digits but no word for ``@`` gives three working
+        detectors and one KeyError, which is worse than a missing row."""
+        assert set(table) == set(SPOKEN_DIGITS)
 
-        assert re.search(rf"(?:{run})(?:[\s.,]+(?:{run})){{5,}}", dictated)
+    @pytest.mark.parametrize(
+        "table", [SPOKEN_DIGITS, SPOKEN_AT, SPOKEN_DOT, NAME_TITLES, OTP_CUES]
+    )
+    @pytest.mark.parametrize("language", sorted(SPOKEN_DIGITS))
+    def test_every_row_compiles_and_matches_nothing_by_itself(
+        self, table: dict[str, str], language: str
+    ) -> None:
+        """A row that grew a stray ``|`` at either end matches the empty string,
+        and a pattern built on it matches everywhere."""
+        row = re.compile(table[language])
 
-    def test_a_multi_word_mark_is_the_caller_s_to_space(self) -> None:
-        """``a còng`` is two words, stored as it is said, and a caller joins on
-        whitespace. Stored with a single space it would fail on two."""
-        assert spoken_pii_forms("vi").at == "a còng"
-        assert len(spoken_pii_forms("vi").at.split()) == 2
-        assert len(spoken_pii_forms("en").at.split()) == 1
+        assert not row.match("")
 
-    def test_the_tone_stripped_view_is_still_words(self) -> None:
-        """Why this lives beside ``normalize_text``: the same scan runs over the
-        raw text and over a stripped view, so both spellings have to be usable."""
-        for word in spoken_pii_forms("vi").digits:
-            stripped = normalize_text(word, remove_tone_marks=True)
-            assert stripped.isalnum()
-            assert len(stripped) == len(word), "an offset has to survive stripping"
+    @pytest.mark.parametrize(
+        "table", [SPOKEN_DIGITS, SPOKEN_AT, SPOKEN_DOT, NAME_TITLES, OTP_CUES]
+    )
+    @pytest.mark.parametrize("language", sorted(SPOKEN_DIGITS))
+    def test_every_alternative_is_a_word_or_a_spaced_phrase(
+        self, table: dict[str, str], language: str
+    ) -> None:
+        """Rows carry two kinds of thing and nothing else: a word, and words
+        joined by ``\\s+``. Any other syntax in a row is a typo -- and a typo
+        here compiles, then matches text no speaker produces."""
+        for alternative in table[language].split("|"):
+            assert re.fullmatch(r"[^\W\d_]+(?:\\s\+[^\W\d_]+)*", alternative), (
+                f"{alternative!r} is not a spoken form"
+            )
+
+    def test_vietnamese_carries_the_two_word_digits(self) -> None:
+        """``mốt``, ``tư`` and ``lăm`` are why a row is a set of words and not ten
+        entries: a table indexed by value cannot hold two words for one digit."""
+        digits = SPOKEN_DIGITS["vi"].split("|")
+
+        assert {"một", "mốt"} <= set(digits)
+        assert {"bốn", "tư"} <= set(digits)
+        assert {"năm", "lăm"} <= set(digits)
+
+    @pytest.mark.parametrize(
+        "table", [SPOKEN_DIGITS, SPOKEN_AT, SPOKEN_DOT, NAME_TITLES, OTP_CUES]
+    )
+    @pytest.mark.parametrize("language", sorted(SPOKEN_DIGITS))
+    def test_every_row_carries_both_spellings(
+        self, table: dict[str, str], language: str
+    ) -> None:
+        """A transcript carries ``không`` and ``khong`` alike and one scan has to
+        catch both, so a row holding a toned phrase holds the stripped one too.
+        This is the assertion that goes red when a row gains a word by hand."""
+        alternatives = table[language].split("|")
+
+        for alternative in alternatives:
+            stripped = normalize_text(alternative, remove_tone_marks=True)
+            assert stripped in alternatives, f"{alternative!r} has no stripped form"
+
+    def test_a_multi_word_phrase_matches_across_any_whitespace(self) -> None:
+        """``a còng`` is two words and a transcript may put a newline between
+        them, which is what the ``\\s+`` in the row is for."""
+        assert re.search(SPOKEN_AT["vi"], "a\n  còng")
+
+    def test_a_longer_phrase_comes_before_the_shorter_one_inside_it(self) -> None:
+        """``mã otp`` before ``otp``, so the cue is consumed whole and the code
+        after it is what the scan reads next."""
+        match = re.match(OTP_CUES["vi"], "mã otp là 1234")
+
+        assert match is not None
+        assert match.group() == "mã otp"
 
     def test_a_language_nobody_wrote_down_is_refused(self) -> None:
         """No fallback. Scanning Spanish with Vietnamese digit words finds
         nothing, and finding nothing is indistinguishable from clean text."""
-        with pytest.raises(ToolkitError, match="es"):
-            spoken_pii_forms("es")
+        with pytest.raises(KeyError):
+            phone_number_detection_by_rules("cero nueve uno", "es")
 
-    def test_the_refusal_names_the_languages_that_are_written_down(self) -> None:
-        """The caller's next move is to fix a name or add a row, and both need to
-        know which names exist."""
-        with pytest.raises(ToolkitError, match="vi"):
-            spoken_pii_forms("")
 
-    def test_a_row_cannot_be_edited(self) -> None:
-        """A NamedTuple, so a consumer that edited one would edit it for all."""
-        with pytest.raises(AttributeError):
-            spoken_pii_forms("vi").digits = ()  # type: ignore[misc]
+class TestPhoneNumberDetectionByRules:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "số của em là 0912345678 ạ",
+            "gọi lại 0912 345 678 nhé",
+            "0912.345.678",
+            "+84912345678",
+        ],
+    )
+    def test_a_written_number_is_found_however_it_is_punctuated(
+        self, text: str
+    ) -> None:
+        """A transcript writes the same number four ways and a caller should not
+        have to normalize before scanning."""
+        assert phone_number_detection_by_rules(text)
+
+    @pytest.mark.parametrize(
+        ("language", "text"),
+        [
+            ("vi", "số không chín một hai ba bốn năm sáu bảy tám"),
+            ("vi", "khong chin mot hai ba bon nam sau bay tam"),
+            ("en", "zero nine one two three four five six seven eight"),
+        ],
+    )
+    def test_a_dictated_number_is_found_in_both_spellings(
+        self, language: str, text: str
+    ) -> None:
+        assert phone_number_detection_by_rules(text, language)
+
+    def test_a_short_run_of_digits_is_not_a_phone_number(self) -> None:
+        """Nine digits is the floor; below it the match would be every order id,
+        price and date in the corpus."""
+        assert phone_number_detection_by_rules("đơn 12345678 ngày 20/08/2026") == []
+
+    def test_digit_words_in_ordinary_prose_are_not_a_phone_number(self) -> None:
+        """``ba``, ``tư`` and ``năm`` are also words. A run long enough to be a
+        number is the whole of what separates the two."""
+        assert phone_number_detection_by_rules("năm nay có ba bốn đơn") == []
+
+    def test_both_forms_come_back_in_document_order(self) -> None:
+        """One scan, not two, so a caller can zip the result against the text."""
+        found = phone_number_detection_by_rules(
+            "0912345678 rồi không chín một hai ba bốn năm sáu bảy tám"
+        )
+
+        assert found[0] == "0912345678"
+        assert found[1].startswith("không")
+
+
+class TestEmailDetectionByRules:
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("mail Dung.MTK2@fptsmartcloud.vn nhé", "Dung.MTK2@fptsmartcloud.vn"),
+            ("a+b@c.co.uk", "a+b@c.co.uk"),
+        ],
+    )
+    def test_a_written_address_is_found_whole(self, text: str, expected: str) -> None:
+        """Including the parts a lazier pattern drops: a ``+`` tag and a
+        two-label domain."""
+        assert email_detection_by_rules(text) == [expected]
+
+    @pytest.mark.parametrize(
+        ("language", "text"),
+        [
+            ("vi", "là dung chấm mtk a còng gmail chấm com ạ"),
+            ("vi", "dung cham mtk a cong gmail cham com"),
+            ("en", "it is dung dot mtk at gmail dot com"),
+        ],
+    )
+    def test_a_dictated_address_is_found_through_the_domain(
+        self, language: str, text: str
+    ) -> None:
+        """The spoken ``.`` marks every label boundary, so the right edge is
+        exact even where the left edge is a guess."""
+        assert email_detection_by_rules(text, language)[0].endswith("com")
+
+    def test_the_dictated_local_part_is_kept(self) -> None:
+        """The half worth redacting. A pattern anchored on ``a còng`` alone finds
+        the domain and leaks the name."""
+        found = email_detection_by_rules("là dung chấm mtk a còng gmail chấm com")
+
+        assert "dung" in found[0]
+
+    def test_a_bare_domain_is_not_an_address(self) -> None:
+        assert email_detection_by_rules("xem tại fptsmartcloud.vn nhé") == []
+
+
+class TestOtpDetectionByRules:
+    @pytest.mark.parametrize(
+        ("language", "text", "expected"),
+        [
+            ("vi", "mã OTP là 482915", "482915"),
+            ("vi", "mã xác thực của anh: 4829", "4829"),
+            ("en", "your verification code is 482915", "482915"),
+        ],
+    )
+    def test_a_cued_code_is_found_without_its_cue(
+        self, language: str, text: str, expected: str
+    ) -> None:
+        """What a caller redacts is the code, so the cue is not in the result."""
+        assert otp_detection_by_rules(text, language) == [expected]
+
+    def test_a_dictated_code_is_found(self) -> None:
+        found = otp_detection_by_rules("mã xác thực bốn tám hai chín một năm")
+
+        assert found == ["bốn tám hai chín một năm"]
+
+    def test_an_uncued_number_is_not_a_code(self) -> None:
+        """The cue is the whole rule: six bare digits are an order number as
+        often as a code, and flagging them would flag every invoice."""
+        assert otp_detection_by_rules("đơn hàng 482915 đã giao") == []
+
+    def test_a_far_away_number_is_not_the_code(self) -> None:
+        """The window is short on purpose; a code follows its cue closely."""
+        text = "mã OTP đã hết hạn, anh vui lòng gọi tổng đài để lấy lại mã 482915"
+
+        assert otp_detection_by_rules(text) == []
+
+
+class TestNameDetectionByRules:
+    @pytest.mark.parametrize(
+        ("language", "text", "expected"),
+        [
+            ("vi", "em nói với anh Nguyễn Văn Dũng rồi", "Nguyễn Văn Dũng"),
+            ("vi", "tên tôi là Dũng ạ", "Dũng"),
+            ("vi", "chào chị Lan, số của chị là 0912345678", "Lan"),
+            ("en", "my name is Dung Tran", "Dung Tran"),
+        ],
+    )
+    def test_a_title_carries_the_name_after_it(
+        self, language: str, text: str, expected: str
+    ) -> None:
+        assert name_detection_by_rules(text, language)[0] == expected
+
+    def test_capitalisation_is_what_ends_a_name(self) -> None:
+        """``chị ấy nói`` has a title and no name, and the alternative -- taking
+        the next word regardless -- makes every pronoun a person."""
+        assert name_detection_by_rules("chị ấy nói vậy") == []
+
+    def test_a_title_with_no_name_does_not_swallow_the_next_one(self) -> None:
+        """The failure the Python-side walk exists to prevent: a single regex over
+        title-plus-words consumes ``Em nói với`` and never reaches ``anh``."""
+        found = name_detection_by_rules("Em nói với anh Nguyễn Văn Dũng rồi ạ")
+
+        assert found == ["Nguyễn Văn Dũng"]
+
+    def test_a_name_nobody_announced_is_not_found(self) -> None:
+        """The documented ceiling of the rule, not a bug: an unannounced name
+        wants a model reading a window."""
+        assert name_detection_by_rules("Dũng gọi lúc 9 giờ") == []

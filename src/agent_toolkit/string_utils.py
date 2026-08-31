@@ -1,5 +1,5 @@
 """String helpers: slot filling, JSON extraction, normalization, hashing, and
-the words a language reads personal data aloud with.
+rule-based detection of the personal data a transcript carries.
 
 ``slot_filling`` and ``extract_json_from_text`` are harvested from
 ``agent-evaluation``'s ``src/utils/string_utils.py``, which was itself a
@@ -13,36 +13,48 @@ on any input. That contract is deliberate: they parse model output, which is
 adversarial by nature, and a caller mid-pipeline should get an empty result it
 can record rather than an exception it has to catch at every call site.
 
-``spoken_pii_forms`` is here rather than in a module of its own because it is the
-other half of ``normalize_text(remove_tone_marks=True)``: a scan for a dictated
-Vietnamese phone number runs the same pattern over the raw text and over a
-tone-stripped view of it, so the words and the stripping are one concern and a
-caller reaches for both in the same breath.
+The ``*_detection_by_rules`` functions are one scan each -- a phone number, an
+email address, an OTP, a name -- rather than one scan for "PII", because the
+kinds have nothing in common at a call site: a pipeline redacts a phone number
+and keeps a name, or the reverse, and each rule is wrong in its own way. Each
+finds both the written form and the form a speaker dictates -- ``0912345678`` and
+``không chín một hai ...`` -- from a table of the words that language reads a
+digit, an ``@`` or a name aloud with.
+
+``by_rules`` is in the name because a rule is not the only way to find these --
+a model reading a bounded window is the other, it belongs to whoever holds the
+model, and the two want telling apart at a call site.
 """
 
 import hashlib
 import json
 import re
 import unicodedata
-from typing import Any, NamedTuple
+from itertools import takewhile
+from typing import Any
 
 import json_repair
 
-from agent_toolkit.errors import ToolkitError
 from agent_toolkit.logging import get_logger
 
 logger = get_logger(__name__)
 
 __all__ = [
-    "SPOKEN_PII_FORMS",
+    "NAME_TITLES",
+    "OTP_CUES",
+    "SPOKEN_AT",
+    "SPOKEN_DIGITS",
+    "SPOKEN_DOT",
     "THINKING_MARKERS",
-    "SpokenPiiForms",
     "clean_thinking_tags",
     "compute_hash",
+    "email_detection_by_rules",
     "extract_json_from_text",
+    "name_detection_by_rules",
     "normalize_text",
+    "otp_detection_by_rules",
+    "phone_number_detection_by_rules",
     "slot_filling",
-    "spoken_pii_forms",
     "split_thinking",
 ]
 
@@ -387,121 +399,106 @@ def split_thinking(text: str) -> tuple[str, str]:
     return "", text
 
 
-class SpokenPiiForms(NamedTuple):
-    """The words one language reads a digit, an ``@`` and a ``.`` aloud with.
+SPOKEN_DIGITS: dict[str, str] = {
+    # Vietnamese says three digits two ways -- một/mốt, bốn/tư, năm/lăm -- which
+    # is why a row is a set of words and not ten entries indexed by value.
+    "vi": r"khong|không|chin|chín|bay|bon|bảy|bốn|hai|lam|lăm|mot|mốt|một|nam|năm|sau|sáu|tam|tám|ba|tu|tư",
+    "en": r"eight|seven|three|five|four|nine|zero|one|six|two|oh",
+}
 
-    These four fields are exactly what a scan for *dictated* personal data needs
-    and nothing else, which is why the type is named for the job rather than for
-    the language: digit words find a phone number or a customer id read out loud,
-    and ``at`` and ``dot`` find an email address. ``0912345678`` looks the same in
-    every language and ``không chín một hai`` does not, so a detector for the
-    spoken form is a pattern plus a vocabulary -- and the vocabulary is the half
-    that changes.
+SPOKEN_AT: dict[str, str] = {"vi": r"a\s+cong|a\s+còng|a\s+moc|a\s+móc|at", "en": r"at"}
+SPOKEN_DOT: dict[str, str] = {"vi": r"cham|chấm|dot", "en": r"point|dot"}
 
-    **The patterns are the caller's.** A regular expression belongs with the tests
-    that hold it, and a library shipping the shapes too would decide what counts
-    as an identifier for every consumer.
+NAME_TITLES: dict[str, str] = {
+    "vi": r"ten\s+toi\s+la|tên\s+tôi\s+là|toi\s+ten|tôi\s+tên|anh|bac|bác|chi|chu|chú|chị|ong|ten|tên|ông|ba|bà|co|cô|em",
+    "en": r"my\s+name\s+is|customer|i\s+am|miss|mrs|dr|mr|ms",
+}
 
-    **Only facts about a language are here.** A telephone numbering plan is not
-    one: how many digits a mobile number carries is a fact about a *country*,
-    changes when a regulator says so, and belongs with the caller that knows which
-    plan it is scanning under. ``at`` and ``dot`` do not change when Vietnam
-    renumbers.
-
-    ``digits`` is a set of words rather than ten entries indexed by value, because
-    a language may say a digit more than one way: Vietnamese has ``một``/``mốt``,
-    ``bốn``/``tư`` and ``năm``/``lăm``, English has ``zero``/``oh``. A caller
-    matching a run of dictated digits wants the alternation, and one that needed a
-    particular word's value would want a different structure than this.
-
-    ``zero`` is separate because it is the one word whose *position* matters: a
-    dictated number opens with it wherever the written form opens with a trunk
-    prefix. ``at`` and ``dot`` may be more than one word -- ``a còng`` is two --
-    so a caller building a pattern joins them on whitespace rather than embedding
-    them verbatim.
-    """
-
-    digits: tuple[str, ...]  # every word this language says a digit with
-    zero: str  # the word a dictated number opens with
-    at: str  # ``@``, read aloud
-    dot: str  # ``.``, read aloud
-
-
-# Vietnamese is measured: these are the forms a Vietnamese call-centre transcript
-# actually carries, including the three digits with two words each. English is
-# straightforward and is here so that ``language`` is a real parameter rather than
-# one entry wearing a signature -- a table with one row has never been indexed by
-# anything.
-SPOKEN_PII_FORMS: dict[str, SpokenPiiForms] = {
-    "vi": SpokenPiiForms(
-        digits=(
-            "không",
-            "một",
-            "mốt",
-            "hai",
-            "ba",
-            "bốn",
-            "tư",
-            "năm",
-            "lăm",
-            "sáu",
-            "bảy",
-            "tám",
-            "chín",
-        ),
-        zero="không",
-        at="a còng",
-        dot="chấm",
-    ),
-    "en": SpokenPiiForms(
-        digits=(
-            "zero",
-            "oh",
-            "one",
-            "two",
-            "three",
-            "four",
-            "five",
-            "six",
-            "seven",
-            "eight",
-            "nine",
-        ),
-        zero="zero",
-        at="at",
-        dot="dot",
-    ),
+OTP_CUES: dict[str, str] = {
+    "vi": r"ma\s+xac\s+nhan|ma\s+xac\s+thuc|mã\s+xác\s+nhận|mã\s+xác\s+thực|ma\s+bao\s+mat|mã\s+bảo\s+mật|ma\s+otp|ma\s+pin|mã\s+otp|mã\s+pin|otp",
+    "en": r"one\s+time\s+password|verification\s+code|security\s+code|otp|pin",
 }
 
 
-def spoken_pii_forms(language: str) -> SpokenPiiForms:
-    """The words ``language`` reads digits and address punctuation aloud with.
+def phone_number_detection_by_rules(text: str, language: str = "vi") -> list[str]:
+    """Phone numbers in ``text``, in document order, written or dictated.
 
-    Unlike the extraction functions above, this raises. A language nobody has
-    written down cannot take a fallback: scanning Spanish text with Vietnamese
-    digit words finds nothing, and finding nothing is indistinguishable from
-    finding clean text -- which is the one failure a recall-first scan cannot
-    report on its own.
+    Written is nine to eleven digits, so ``0912 345 678``, ``0912.345.678`` and
+    ``+84912345678`` all match; a longer run is not a phone number and a shorter
+    one is an OTP or a house number. Dictated is a run of that many digit words
+    -- ``không chín một hai ba bốn năm sáu bảy tám``.
 
-    Two languages are written down. A third arrives with the corpus that needs
-    it: inventing a vocabulary nobody has read aloud produces a detector that
-    looks tested and matches text no speaker of that language produces.
-
-    Args:
-        language: A key of :data:`SPOKEN_PII_FORMS`, such as ``"vi"``.
-
-    Returns:
-        The vocabulary for that language.
-
-    Raises:
-        ToolkitError: No vocabulary is written down for ``language``. The message
-            names the ones that are, because the caller's next move is either to
-            correct a configured name or to add a row.
+    Recall-first: a Vietnamese digit word is also an ordinary word, so a long
+    enough run of ``ba``, ``tư`` and ``năm`` in prose will match. Cheap to filter
+    downstream, expensive to miss.
     """
-    if language not in SPOKEN_PII_FORMS:
-        known = ", ".join(sorted(SPOKEN_PII_FORMS))
-        raise ToolkitError(
-            f"no spoken PII forms are written down for language {language!r}; "
-            f"known: {known}"
-        )
-    return SPOKEN_PII_FORMS[language]
+    said = SPOKEN_DIGITS[language]
+    return re.findall(
+        r"(?<!\w)\+?\d(?:[\s.-]?\d){8,10}(?!\w)"
+        rf"|(?:{said})(?:[\s.,]+(?:{said})){{8,10}}",
+        text,
+        re.IGNORECASE,
+    )
+
+
+def email_detection_by_rules(text: str, language: str = "vi") -> list[str]:
+    """Email addresses in ``text``, in document order, written or dictated.
+
+    The written shape is a fact about a format rather than about a corpus, so it
+    needs no vocabulary; the dictated one -- ``dung chấm mtk a còng gmail chấm
+    com`` -- needs the words for ``@`` and ``.``.
+
+    The domain ends a dictated match exactly, because the spoken ``.`` marks every
+    label boundary. Where the local part *begins* is not knowable from the words --
+    nothing tells ``là dung chấm mtk`` apart from the address itself -- so the rule
+    takes up to four words before the ``@``: it over-captures a filler word and
+    under-captures no address.
+    """
+    at, dot = SPOKEN_AT[language], SPOKEN_DOT[language]
+    return re.findall(
+        r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"
+        rf"|(?:[\w.+-]+\s+){{1,4}}(?:{at})(?:\s+[\w-]+)+?"
+        rf"(?:\s+(?:{dot})\s+[\w-]+)+",
+        text,
+        re.IGNORECASE,
+    )
+
+
+def otp_detection_by_rules(text: str, language: str = "vi") -> list[str]:
+    """One-time codes in ``text``, in document order.
+
+    Four to eight digits, written or dictated, and only when a cue word puts one
+    there: a bare ``123456`` is an order number as often as a code, and a scan
+    that claimed it would flag every invoice in the corpus. The cue is dropped
+    from the result -- what a caller redacts is the code.
+    """
+    cue, said = OTP_CUES[language], SPOKEN_DIGITS[language]
+    return re.findall(
+        rf"(?:{cue}).{{0,20}}?"
+        rf"(\d(?:[\s.-]?\d){{3,7}}|(?:{said})(?:[\s.,]+(?:{said})){{3,7}})",
+        text,
+        re.IGNORECASE,
+    )
+
+
+def name_detection_by_rules(text: str, language: str = "vi") -> list[str]:
+    """Personal names in ``text``, in document order, by the one rule that needs
+    no list of names: a title or an introduction, then the capitalised words
+    after it.
+
+    So ``anh Nguyễn Văn Dũng`` and ``my name is Dung`` are found, and a name
+    nobody announced is not -- that one wants a model reading a window, not a
+    rule. Capitalisation is what ends a name, which is why ``chị ấy nói`` yields
+    nothing rather than yielding ``ấy nói``.
+    """
+    title = NAME_TITLES[language]
+    names = []
+    for cue in re.finditer(rf"(?<!\w)(?:{title})[\s,.:]+", text, re.IGNORECASE):
+        # Scanning for the title alone and reading the words after it in Python,
+        # rather than capturing them: a regex cannot say "an uppercase letter"
+        # for Vietnamese, whose precomposed vowels interleave the two cases.
+        after = re.findall(r"[^\W\d_]+", text[cue.end() : cue.end() + 60])[:4]
+        found = " ".join(takewhile(lambda word: word[:1].isupper(), after))
+        if found:
+            names.append(found)
+    return names
