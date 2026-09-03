@@ -1,42 +1,6 @@
-"""One LLM call: resolve settings, throttle, attempt, retry, map the error.
+"""wiring. One chat call: resolve, throttle, attempt, retry, map."""
 
-This is the harvested ``factory.py``'s ``complete()`` with its two host couplings
-cut. The retry defaults no longer come from ``src.dependencies.settings`` (see
-:mod:`agent_toolkit.llm.retry`), and the traffic controller no longer arrives
-inside a process-cached ``LLMConfig`` but is fetched per event loop from
-:func:`agent_toolkit.llm.get_traffic_controller`.
-
-Three changes beyond that, each visible in ``tests/test_llm_complete.py``:
-
-- ``reraise=True``. Without it tenacity raises its own ``RetryError`` once the
-  attempts run out, so the error a caller sees on exhaustion is *not* from the
-  ``LLMError`` taxonomy the rest of this package builds -- the mapped exception
-  is buried in ``RetryError.last_attempt``. Every other outcome raises an
-  ``LLMError``; exhaustion did not.
-- The retry predicate is ``is_retriable`` alone. The original OR-ed it with
-  ``retry_if_exception_type(LLMRateLimitError) | retry_if_exception_type(LLMTimeoutError)``,
-  both of which ``is_retriable`` already answers True for.
-- ``max_retries`` / ``retry_delay`` / ``exponential_backoff`` are rejected rather
-  than accepted. They are ``RetryPolicy`` fields now, and ``**kwargs`` here goes
-  into the request body -- so silently accepting them would ship ``max_retries``
-  to the provider as a chat-completion parameter and quietly use the default
-  policy. Five call sites in ``agent-evaluation`` pass ``max_retries=``; a
-  ``TypeError`` naming the replacement is what they should meet.
-
-``complete_with_reasoning`` is the function; ``complete`` is it with the reasoning
-dropped. The harvested code had only the second, and suppressed thinking on any
-``qwen3*`` model to keep it from polluting the answer -- so reasoning was
-unavailable by construction. It is now a parameter (``enable_thinking``, unset by
-default) and a return field.
-
-``LLMConfig.max_tokens``, ``temperature``, ``top_p``, ``timeout``,
-``enable_thinking``, ``max_concurrency`` and ``requests_per_minute`` are read
-here. In the harvested code the ones that existed were read by nobody:
-``_resolve_config`` did not return them and every call site passed its own. A
-resolver that sets them now has them honored, and a caller's explicit argument
-still wins.
-"""
-
+import time
 from typing import Any
 
 import tenacity
@@ -45,15 +9,25 @@ from agent_toolkit.llm.config import resolve_config
 from agent_toolkit.llm.error_mapping import is_retriable, map_error
 from agent_toolkit.llm.exceptions import LLMConfigError
 from agent_toolkit.llm.executors import Completion, sdk_complete
-from agent_toolkit.llm.retry import RetryPolicy, backoff, get_default_retry_policy
 from agent_toolkit.llm.traffic_control import get_traffic_controller
 from agent_toolkit.logging import get_logger
 
 logger = get_logger(__name__)
 
-__all__ = ["complete", "complete_with_reasoning"]
+__all__ = [
+    "DEFAULT_EXPONENTIAL_BACKOFF",
+    "DEFAULT_MAX_RETRIES",
+    "DEFAULT_RETRY_DELAY",
+    "MAX_BACKOFF",
+    "complete",
+    "complete_with_reasoning",
+]
 
-_REPLACED_BY_POLICY = ("max_retries", "retry_delay", "exponential_backoff")
+DEFAULT_MAX_RETRIES = 8
+DEFAULT_RETRY_DELAY = 5.0
+DEFAULT_EXPONENTIAL_BACKOFF = True
+
+MAX_BACKOFF = 120.0
 
 
 async def complete_with_reasoning(
@@ -68,61 +42,11 @@ async def complete_with_reasoning(
     extra_headers: dict[str, str] | None = None,
     reasoning_effort: str | None = None,
     enable_thinking: bool | None = None,
-    retry: RetryPolicy | None = None,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_delay: float = DEFAULT_RETRY_DELAY,
+    exponential_backoff: bool = DEFAULT_EXPONENTIAL_BACKOFF,
     **kwargs: Any,
 ) -> Completion:
-    """Complete ``prompt`` against an OpenAI-compatible endpoint.
-
-    Args:
-        prompt: The user prompt. Ignored if ``messages`` is given.
-        system_prompt: Prepended as a system message. Ignored if ``messages`` is given.
-        model: Model name, and the key the installed resolver looks up.
-        api_key: Overrides the resolved key. ``""`` is respected as "no key".
-        base_url: Overrides the resolved endpoint.
-        api_version: Accepted and unused. It configures the Azure client, and the
-            Azure binding is out of scope for v0.1; the harvested code accepted
-            and ignored it identically. Named explicitly rather than left to
-            ``**kwargs`` so it cannot reach the request body.
-        binding: Provider label, used for the ``provider`` on mapped errors.
-        messages: A pre-built message list, used instead of ``prompt``.
-        extra_headers: Merged over the resolved headers for this call only.
-        reasoning_effort: Passed through when set.
-        enable_thinking: Sent as the ``enable_thinking`` chat-template kwarg when
-            set; ``True`` asks for reasoning, ``False`` suppresses it. Left
-            ``None`` -- the default -- the resolved config's value is used, and
-            if that is also unset nothing is sent and the server decides.
-            **Do not assume that default.** A self-hosted ``gemma-4-31B-it``
-            returned no reasoning at all until asked explicitly, and then returned
-            459 characters of it on the same prompt; Qwen3's template defaults the
-            other way. Sent for any model, not just the Qwen line the harvested
-            code special-cased: that endpoint accepted the kwarg for a gemma
-            model, and a server that does not know it answers 400, which is a
-            clearer outcome than silently dropping what the caller asked for.
-        retry: Overrides the process-wide :class:`RetryPolicy` for this call.
-        **kwargs: Extra chat-completion parameters (``temperature``,
-            ``max_tokens``, ``top_p``, …). Forwarded to the provider verbatim.
-            ``max_tokens``, ``temperature``, and ``top_p`` fall back to the
-            resolved config when not passed here; ``top_p`` is sent only when one
-            of the two supplies it, since not every endpoint accepts it.
-
-    Returns:
-        A :class:`Completion`. ``content`` is the answer with any inline
-        ``<think>`` block removed, ``""`` if the response carries no extractable
-        text; ``reasoning`` is the reasoning field or that inline block, ``""``
-        when there was none.
-
-    Raises:
-        LLMConfigError: No model, or the resolver could not produce a config.
-        LLMError: Any provider failure, mapped to the taxonomy, after the retry
-            policy is exhausted.
-    """
-    for name in _REPLACED_BY_POLICY:
-        if name in kwargs:
-            raise TypeError(
-                f"complete() no longer takes {name!r}: pass "
-                f"retry=RetryPolicy({name}=...) or call set_default_retry_policy() once"
-            )
-
     config = resolve_config(
         model=model,
         api_key=api_key,
@@ -132,7 +56,15 @@ async def complete_with_reasoning(
         extra_headers=extra_headers,
         reasoning_effort=reasoning_effort,
     )
-    policy = retry if retry is not None else get_default_retry_policy()
+    wait_strategy = (
+        tenacity.wait_exponential(
+            multiplier=retry_delay,
+            min=retry_delay,
+            max=MAX_BACKOFF,
+        )
+        if exponential_backoff
+        else tenacity.wait_fixed(retry_delay)
+    )
     controller = get_traffic_controller(
         config.model,
         max_concurrency=config.max_concurrency,
@@ -141,11 +73,6 @@ async def complete_with_reasoning(
 
     kwargs.setdefault("max_tokens", config.max_tokens)
     kwargs.setdefault("temperature", config.temperature)
-    # ``setdefault`` rather than passing it to ``sdk_complete`` below, because
-    # ``timeout`` is a named parameter there: passing both would be "got multiple
-    # values for keyword argument" for any caller who passes ``timeout=``, and
-    # that TypeError is raised inside the retried block, so it would be caught,
-    # mapped, and retried nine times before surfacing.
     kwargs.setdefault("timeout", config.timeout)
     if config.top_p is not None:
         kwargs.setdefault("top_p", config.top_p)
@@ -161,22 +88,19 @@ async def complete_with_reasoning(
         logger.warning(
             "LLM call failed (attempt %s/%s), retrying in %.1fs: %s",
             retry_state.attempt_number,
-            policy.max_retries + 1,
+            max_retries + 1,
             retry_state.upcoming_sleep,
             message,
         )
 
     @tenacity.retry(
         retry=tenacity.retry_if_exception(is_retriable),
-        wait=backoff(policy),
-        stop=tenacity.stop_after_attempt(policy.max_retries + 1),
+        wait=wait_strategy,
+        stop=tenacity.stop_after_attempt(max_retries + 1),
         before_sleep=log_retry,
         reraise=True,
     )
     async def attempt() -> Completion:
-        # The controller is entered per attempt, so a failed attempt returns its
-        # concurrency slot before the retry sleeps rather than holding it for the
-        # whole backoff.
         try:
             async with controller:
                 return await sdk_complete(
@@ -196,7 +120,38 @@ async def complete_with_reasoning(
         except Exception as exc:
             raise map_error(exc, provider=config.binding) from exc
 
-    return await attempt()
+    logger.debug(
+        "LLM call: model=%s binding=%s base_url=%s max_tokens=%s temperature=%s "
+        "reasoning_effort=%s enable_thinking=%s max_retries=%s",
+        config.model,
+        config.binding,
+        config.base_url,
+        kwargs.get("max_tokens"),
+        kwargs.get("temperature"),
+        config.reasoning_effort,
+        enable_thinking,
+        max_retries,
+    )
+    started = time.perf_counter()
+    try:
+        completion = await attempt()
+    except Exception as exc:
+        logger.error(
+            "LLM call failed after %.2fs: model=%s %s: %s",
+            time.perf_counter() - started,
+            config.model,
+            type(exc).__name__,
+            exc,
+        )
+        raise
+    logger.debug(
+        "LLM call ok in %.2fs: model=%s content=%d chars reasoning=%d chars",
+        time.perf_counter() - started,
+        config.model,
+        len(completion.content),
+        len(completion.reasoning),
+    )
+    return completion
 
 
 async def complete(
@@ -211,17 +166,11 @@ async def complete(
     extra_headers: dict[str, str] | None = None,
     reasoning_effort: str | None = None,
     enable_thinking: bool | None = None,
-    retry: RetryPolicy | None = None,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_delay: float = DEFAULT_RETRY_DELAY,
+    exponential_backoff: bool = DEFAULT_EXPONENTIAL_BACKOFF,
     **kwargs: Any,
 ) -> str:
-    """The answer text from :func:`complete_with_reasoning`, and nothing else.
-
-    The signature is spelled out rather than forwarded through ``*args`` because
-    the spec pins it for the ``agent-evaluation`` migration: ``str`` in, ``str``
-    out, every parameter named and type-checked at the call site. Reasoning is
-    reachable only through the sibling above, so a caller that wants it changes
-    one name and a caller that does not is unaffected.
-    """
     completion = await complete_with_reasoning(
         prompt,
         system_prompt=system_prompt,
@@ -234,7 +183,9 @@ async def complete(
         extra_headers=extra_headers,
         reasoning_effort=reasoning_effort,
         enable_thinking=enable_thinking,
-        retry=retry,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
+        exponential_backoff=exponential_backoff,
         **kwargs,
     )
     return completion.content

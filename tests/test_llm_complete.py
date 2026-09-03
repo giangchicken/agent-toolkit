@@ -12,13 +12,15 @@ uses. ``test_the_sdk_still_uses_httpx2`` is the tripwire: if the openai pin ever
 moves back to the ``httpx`` line, that one test fails loudly instead of thirty
 tests quietly reaching for the network.
 
-Two behaviors tested here are changes rather than harvested, and each has a
+One behavior tested here is a change rather than harvested, and it has a
 control test that fails against the unchanged version: exhaustion raising the
-mapped ``LLMError`` instead of tenacity's ``RetryError``, and the legacy retry
-keywords raising instead of being forwarded into the request body.
+mapped ``LLMError`` instead of tenacity's ``RetryError``. Retry itself is the
+harvested shape -- ``max_retries``, ``retry_delay`` and ``exponential_backoff``
+as named parameters over module-level defaults.
 """
 
 import asyncio
+import inspect
 import json
 from collections.abc import Callable, Iterator
 from dataclasses import FrozenInstanceError, replace
@@ -29,17 +31,16 @@ import pytest
 import tenacity
 from openai import AsyncOpenAI
 
+from agent_toolkit.embed import vectors
 from agent_toolkit.llm import (
     Completion,
     DictConfigResolver,
     LLMConfig,
-    RetryPolicy,
     complete,
     complete_with_reasoning,
-    get_default_retry_policy,
+    factory,
     get_traffic_controller,
     set_config_resolver,
-    set_default_retry_policy,
 )
 from agent_toolkit.llm.exceptions import (
     LLMAPIError,
@@ -50,7 +51,6 @@ from agent_toolkit.llm.executors import (
     extract_reasoning_content,
     extract_response_content,
 )
-from agent_toolkit.llm.retry import backoff
 
 BASE_URL = "https://api.test/v1"
 MODEL = "test-model"
@@ -61,9 +61,10 @@ THINKING_MODEL = "qwen3-8b"
 
 REPLY = "Xin chào, tôi có thể giúp gì cho bạn?"
 
-# Two retries and no delay. The real default is eight retries five seconds
-# apart, which would make one exhaustion test take ten minutes.
-FAST = RetryPolicy(max_retries=2, base_delay=0.0)
+# Two retries and no delay, passed explicitly wherever a test makes the retry
+# actually fire. The module defaults are eight retries five seconds apart, which
+# would make one exhaustion test take eight minutes.
+FAST = {"max_retries": 2, "retry_delay": 0.0}
 
 Handler = Callable[[httpx2.Request], httpx2.Response]
 
@@ -142,10 +143,8 @@ def _install(**overrides: Any) -> None:
 @pytest.fixture(autouse=True)
 def isolated() -> Iterator[None]:
     _install()
-    set_default_retry_policy(FAST)
     yield
     set_config_resolver(None)
-    set_default_retry_policy(None)
 
 
 @pytest.fixture
@@ -234,14 +233,14 @@ class TestRetry:
         self, api: Callable[..., FakeEndpoint]
     ) -> None:
         endpoint = api(fail(500), ok())
-        assert await complete(model=MODEL, prompt="Chào bạn") == REPLY
+        assert await complete(model=MODEL, prompt="Chào bạn", **FAST) == REPLY
         assert endpoint.call_count == 2
 
     async def test_a_rate_limit_is_retried(
         self, api: Callable[..., FakeEndpoint]
     ) -> None:
         endpoint = api(fail(429, "rate limit exceeded"), ok())
-        assert await complete(model=MODEL, prompt="Chào bạn") == REPLY
+        assert await complete(model=MODEL, prompt="Chào bạn", **FAST) == REPLY
         assert endpoint.call_count == 2
 
     async def test_exhaustion_raises_the_mapped_error_not_tenacitys(
@@ -255,10 +254,10 @@ class TestRetry:
         """
         endpoint = api(fail(500))
         with pytest.raises(LLMAPIError) as caught:
-            await complete(model=MODEL, prompt="Chào bạn")
+            await complete(model=MODEL, prompt="Chào bạn", **FAST)
         assert caught.value.status_code == 500
         assert not isinstance(caught.value, tenacity.RetryError)
-        assert endpoint.call_count == FAST.max_retries + 1
+        assert endpoint.call_count == FAST["max_retries"] + 1
 
     async def test_without_reraise_tenacity_would_hide_the_mapped_error(self) -> None:
         """Control for the test above: prove ``reraise=True`` is load-bearing."""
@@ -316,93 +315,78 @@ class TestRetry:
     ) -> None:
         endpoint = api(fail(500))
         with pytest.raises(LLMAPIError):
-            await complete(
-                model=MODEL, prompt="Chào bạn", retry=RetryPolicy(max_retries=0)
-            )
+            await complete(model=MODEL, prompt="Chào bạn", max_retries=0)
         assert endpoint.call_count == 1
-
-
-# --- the backoff curve -------------------------------------------------------
-
-
-def _state(attempt: int, error: BaseException | None = None) -> tenacity.RetryCallState:
-    state = tenacity.RetryCallState(None, None, (), {})  # type: ignore[arg-type]
-    state.attempt_number = attempt
-    if error is not None:
-        state.set_exception((type(error), error, error.__traceback__))
-    return state
-
-
-class TestBackoff:
-    def test_it_doubles_from_the_base_delay(self) -> None:
-        wait = backoff(RetryPolicy(base_delay=5.0))
-        assert [wait(_state(n)) for n in (1, 2, 3, 4)] == [5.0, 10.0, 20.0, 40.0]
-
-    def test_it_is_capped_at_two_minutes(self) -> None:
-        wait = backoff(RetryPolicy(base_delay=5.0))
-        assert wait(_state(30)) == 120.0
-
-    def test_a_fixed_policy_repeats_the_base_delay(self) -> None:
-        wait = backoff(RetryPolicy(base_delay=3.0, exponential_backoff=False))
-        assert [wait(_state(n)) for n in (1, 2, 3)] == [3.0, 3.0, 3.0]
-
-    def test_retry_after_raises_the_floor(self) -> None:
-        wait = backoff(RetryPolicy(base_delay=5.0))
-        error = LLMRateLimitError("slow down", retry_after=45.0)
-        assert wait(_state(1)) == 5.0
-        assert wait(_state(1, error)) == 45.0
-
-    def test_a_larger_computed_backoff_wins(self) -> None:
-        wait = backoff(RetryPolicy(base_delay=5.0))
-        error = LLMRateLimitError("slow down", retry_after=10.0)
-        assert wait(_state(5, error)) == 80.0
-
-    def test_another_error_leaves_the_backoff_alone(self) -> None:
-        wait = backoff(RetryPolicy(base_delay=5.0))
-        error = LLMAPIError("server exploded", status_code=500)
-        assert wait(_state(1, error)) == 5.0
 
 
 class TestRetryAfterIsNotPopulatedYet:
     async def test_the_header_is_ignored_by_the_mapper(
         self, api: Callable[..., FakeEndpoint]
     ) -> None:
-        """Pins the gap the backoff floor is waiting on.
+        """``map_error`` never reads ``Retry-After``.
 
-        ``map_error`` builds ``LLMRateLimitError(str(exc), provider=...)`` and
-        never reads ``Retry-After``, so the floor in ``backoff`` is unreachable
-        from a real 429 -- in the harvested code too, where ``stream()`` was its
-        only reader. This test fails the day someone populates it, which is the
-        point: closing the gap should be a visible change, not a silent one.
+        It builds ``LLMRateLimitError(str(exc), provider=...)`` and nothing
+        else, in the harvested code too. This test fails the day someone
+        populates it, which is the point: closing the gap should be a visible
+        change rather than a silent one.
         """
         api(fail(429, "rate limit exceeded", **{"Retry-After": "30"}))
         with pytest.raises(LLMRateLimitError) as caught:
-            await complete(
-                model=MODEL, prompt="Chào bạn", retry=RetryPolicy(max_retries=0)
-            )
+            await complete(model=MODEL, prompt="Chào bạn", max_retries=0)
         assert caught.value.retry_after is None
 
 
-# --- the retry keywords the policy replaced ---------------------------------
+# --- the retry keywords, as named parameters --------------------------------
 
 
-class TestReplacedKeywords:
+class TestRetryKeywords:
+    """``max_retries``, ``retry_delay`` and ``exponential_backoff``.
+
+    The three names the harvested ``complete()`` took. They are named
+    parameters here too, so they configure the retry and never fall through
+    ``**kwargs`` into the request body.
+    """
+
+    async def test_max_retries_caps_the_attempts(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        endpoint = api(fail(500))
+        with pytest.raises(LLMAPIError):
+            await complete(model=MODEL, prompt="Chào bạn", max_retries=0)
+        assert endpoint.call_count == 1
+
+    async def test_they_override_the_default_policy(
+        self, api: Callable[..., FakeEndpoint]
+    ) -> None:
+        endpoint = api(fail(500))
+        with pytest.raises(LLMAPIError):
+            await complete(
+                model=MODEL,
+                prompt="Chào bạn",
+                max_retries=1,
+                retry_delay=0.0,
+                exponential_backoff=False,
+            )
+        assert endpoint.call_count == 2
+
     @pytest.mark.parametrize(
-        "name", ["max_retries", "retry_delay", "exponential_backoff"]
+        ("name", "value"),
+        [("max_retries", 0), ("retry_delay", 0.0), ("exponential_backoff", False)],
     )
-    async def test_they_raise_and_name_the_policy(self, name: str) -> None:
-        with pytest.raises(TypeError, match="RetryPolicy"):
-            await complete(model=MODEL, prompt="Chào bạn", **{name: 3})
+    async def test_they_never_reach_the_request_body(
+        self, api: Callable[..., FakeEndpoint], name: str, value: object
+    ) -> None:
+        endpoint = api(ok())
+        await complete(model=MODEL, prompt="Chào bạn", **{name: value})
+        assert name not in endpoint.body()
 
     async def test_an_unknown_keyword_really_does_reach_the_provider(
         self, api: Callable[..., FakeEndpoint]
     ) -> None:
-        """Why the guard above is not paranoia.
+        """``**kwargs`` is the chat-completion passthrough.
 
-        ``**kwargs`` is the chat-completion passthrough, so a keyword this
-        function does not name lands in the request body. Accepting
-        ``max_retries`` there would send it to the provider *and* retry with the
-        default policy anyway.
+        A keyword this function does not name lands in the request body, which
+        is why the three above are named rather than left to fall through.
         """
         endpoint = api(ok())
         await complete(model=MODEL, prompt="Chào bạn", top_p=0.25)
@@ -425,7 +409,7 @@ class TestTrafficControl:
 
         api(record)
         with pytest.raises(LLMAPIError):
-            await complete(model=MODEL, prompt="Chào bạn")
+            await complete(model=MODEL, prompt="Chào bạn", **FAST)
         assert seen == [1, 1, 1]
 
     async def test_a_failed_attempt_gives_its_slot_back(
@@ -434,7 +418,7 @@ class TestTrafficControl:
         _install(max_concurrency=1)
         api(fail(500), fail(500), fail(500), ok())
         with pytest.raises(LLMAPIError):
-            await complete(model=MODEL, prompt="Chào bạn")
+            await complete(model=MODEL, prompt="Chào bạn", **FAST)
         controller = get_traffic_controller(MODEL)
         assert controller.active_requests == 0
         # With one slot in total, a slot leaked by the three failures above would
@@ -655,25 +639,37 @@ class TestExtractResponseContent:
         assert "provider_specific_fields" not in result
 
 
-# --- the policy itself -------------------------------------------------------
+# --- the retry defaults ------------------------------------------------------
 
 
-class TestDefaultPolicy:
-    def test_the_defaults_are_the_hosts_settings(self) -> None:
+class TestRetryDefaults:
+    def test_they_are_the_hosts_settings(self) -> None:
         """The numbers ``factory.py:35`` used to import from ``src.dependencies``."""
-        policy = RetryPolicy()
-        assert (policy.max_retries, policy.base_delay, policy.exponential_backoff) == (
-            8,
-            5.0,
-            True,
-        )
+        assert (
+            factory.DEFAULT_MAX_RETRIES,
+            factory.DEFAULT_RETRY_DELAY,
+            factory.DEFAULT_EXPONENTIAL_BACKOFF,
+        ) == (8, 5.0, True)
 
-    def test_it_can_be_set_once_and_reset(self) -> None:
-        mine = RetryPolicy(max_retries=1, base_delay=0.5, exponential_backoff=False)
-        set_default_retry_policy(mine)
-        assert get_default_retry_policy() == mine
-        set_default_retry_policy(None)
-        assert get_default_retry_policy() == RetryPolicy()
+    def test_the_backoff_is_capped_at_two_minutes(self) -> None:
+        assert factory.MAX_BACKOFF == 120.0
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("max_retries", 8),
+            ("retry_delay", 5.0),
+            ("exponential_backoff", True),
+        ],
+    )
+    def test_an_unset_keyword_takes_the_module_default(
+        self, name: str, expected: object
+    ) -> None:
+        """The defaults are bound into the signature, as in the harvested code."""
+        for func in (complete, complete_with_reasoning, vectors):
+            assert inspect.signature(func).parameters[name].default == expected, (
+                func.__name__
+            )
 
 
 # --- thinking and reasoning --------------------------------------------------
@@ -832,7 +828,7 @@ class TestCompleteStillReturnsAString:
             system_prompt="Bạn là trợ lý.",
             model=MODEL,
             enable_thinking=False,
-            retry=FAST,
+            max_retries=0,
             top_p=0.25,
         )
         body = endpoint.body()

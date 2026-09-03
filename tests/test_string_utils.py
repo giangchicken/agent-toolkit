@@ -17,15 +17,16 @@ import textwrap
 
 import pytest
 
-from agent_toolkit.string_utils import (
-    MAX_SLOT_FILLING_PASSES,
+from agent_toolkit.lexicon import (
     NAME_TITLES,
     OTP_CUES,
     SPOKEN_AT,
     SPOKEN_DIGITS,
     SPOKEN_DOT,
     THINKING_MARKERS,
-    clean_thinking_tags,
+)
+from agent_toolkit.string_utils import (
+    MAX_SLOT_FILLING_PASSES,
     compute_hash,
     email_detection_by_rules,
     extract_json_from_text,
@@ -414,28 +415,6 @@ class TestComputeHash:
         assert len(compute_hash("khách hàng đã đồng ý")) == 64
 
 
-class TestCleanThinkingTags:
-    def test_removes_a_think_block(self) -> None:
-        assert clean_thinking_tags("<think>reasoning</think>answer") == "answer"
-
-    def test_removes_a_multiline_think_block(self) -> None:
-        assert clean_thinking_tags("<think>\na\nb\n</think>\nanswer") == "answer"
-
-    def test_is_case_insensitive(self) -> None:
-        assert clean_thinking_tags("<THINK>x</THINK>answer") == "answer"
-
-    def test_returns_empty_string_for_empty_input(self) -> None:
-        assert clean_thinking_tags("") == ""
-
-    def test_leaves_untagged_content_alone(self) -> None:
-        assert clean_thinking_tags("just an answer") == "just an answer"
-
-    def test_accepts_and_ignores_binding_and_model(self) -> None:
-        """Signature compatibility with the harvested call sites."""
-        result = clean_thinking_tags("<think>x</think>a", binding="openai", model="glm")
-        assert result == "a"
-
-
 class TestSplitThinking:
     def test_a_well_formed_block_splits(self) -> None:
         assert split_thinking("<think>why</think>answer") == (
@@ -447,22 +426,14 @@ class TestSplitThinking:
         """The shape most vLLM deployments of Qwen3 and DeepSeek-R1 return.
 
         The chat template writes ``<think>`` itself, so the response starts mid
-        reasoning and only the closing tag is in it. ``clean_thinking_tags`` leaves
-        this whole thing intact, reasoning included -- the control below.
+        reasoning and only the closing tag is in it. A regex needing both tags
+        would leave this whole thing intact, reasoning included.
         """
         assert split_thinking("why</think>answer") == ("why</think>", "answer")
-
-    def test_clean_thinking_tags_would_have_kept_the_reasoning(self) -> None:
-        """The control for the case above."""
-        assert clean_thinking_tags("why</think>answer") == "why</think>answer"
 
     def test_a_truncated_block_leaves_no_answer(self) -> None:
         """Cut off by ``max_tokens`` mid-thought: there is no answer to report."""
         assert split_thinking("<think>why and then") == ("<think>why and then", "")
-
-    def test_clean_thinking_tags_would_have_called_that_an_answer(self) -> None:
-        """The control for the case above."""
-        assert clean_thinking_tags("<think>why and then") == "<think>why and then"
 
     def test_unmarked_text_is_all_answer(self) -> None:
         assert split_thinking("just an answer") == ("", "just an answer")

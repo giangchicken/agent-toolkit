@@ -1,7 +1,7 @@
-"""shape. The error taxonomy the chat route raises."""
+"""shape. The error taxonomy this route raises, its own and not the chat route's."""
 
 
-class LLMError(Exception):
+class EmbedError(Exception):
     def __init__(
         self,
         message: str,
@@ -20,19 +20,15 @@ class LLMError(Exception):
         return f"{provider_prefix}{self.message}"
 
 
-class LLMConfigError(LLMError):
+class EmbedConfigError(EmbedError):
     pass
 
 
-class LLMProviderError(LLMError):
+class EmbedProviderError(EmbedError):
     pass
 
 
-class LLMCircuitBreakerError(LLMError):
-    pass
-
-
-class LLMAPIError(LLMError):
+class EmbedAPIError(EmbedError):
     def __init__(
         self,
         message: str,
@@ -53,7 +49,7 @@ class LLMAPIError(LLMError):
         return " ".join(parts)
 
 
-class LLMTimeoutError(LLMAPIError):
+class EmbedTimeoutError(EmbedAPIError):
     def __init__(
         self,
         message: str = "Request timed out",
@@ -64,7 +60,7 @@ class LLMTimeoutError(LLMAPIError):
         self.timeout = timeout
 
 
-class LLMRateLimitError(LLMAPIError):
+class EmbedRateLimitError(EmbedAPIError):
     def __init__(
         self,
         message: str = "Rate limit exceeded",
@@ -75,7 +71,7 @@ class LLMRateLimitError(LLMAPIError):
         self.retry_after = retry_after
 
 
-class LLMAuthenticationError(LLMAPIError):
+class EmbedAuthenticationError(EmbedAPIError):
     def __init__(
         self,
         message: str = "Authentication failed",
@@ -84,7 +80,7 @@ class LLMAuthenticationError(LLMAPIError):
         super().__init__(message, status_code=401, provider=provider)
 
 
-class LLMModelNotFoundError(LLMAPIError):
+class EmbedModelNotFoundError(EmbedAPIError):
     def __init__(
         self,
         message: str = "Model not found",
@@ -95,35 +91,28 @@ class LLMModelNotFoundError(LLMAPIError):
         self.model = model
 
 
-class LLMParseError(LLMError):
-    def __init__(
-        self,
-        message: str = "Failed to parse LLM output",
-        provider: str | None = None,
-        details: dict[str, object] | None = None,
-    ):
-        super().__init__(message, details=details, provider=provider)
+class EmbedInputTooLargeError(EmbedAPIError):
+    """One input over the model's token limit, not a conversation over a window.
+
+    The chat route's ``ProviderContextWindowError`` counts a whole request; here
+    the limit is per text, so the caller's remedy is to chunk that text rather
+    than to drop earlier turns.
+    """
 
 
-class ProviderQuotaExceededError(LLMRateLimitError):
-    pass
-
-
-class ProviderContextWindowError(LLMAPIError):
+class EmbedQuotaExceededError(EmbedRateLimitError):
     pass
 
 
 __all__ = [
-    "LLMAPIError",
-    "LLMAuthenticationError",
-    "LLMCircuitBreakerError",
-    "LLMConfigError",
-    "LLMError",
-    "LLMModelNotFoundError",
-    "LLMParseError",
-    "LLMProviderError",
-    "LLMRateLimitError",
-    "LLMTimeoutError",
-    "ProviderContextWindowError",
-    "ProviderQuotaExceededError",
+    "EmbedAPIError",
+    "EmbedAuthenticationError",
+    "EmbedConfigError",
+    "EmbedError",
+    "EmbedInputTooLargeError",
+    "EmbedModelNotFoundError",
+    "EmbedProviderError",
+    "EmbedQuotaExceededError",
+    "EmbedRateLimitError",
+    "EmbedTimeoutError",
 ]

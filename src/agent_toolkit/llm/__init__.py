@@ -1,15 +1,8 @@
-"""OpenAI-compatible LLM client. Requires the ``agent-toolkit[llm]`` extra.
-
-The gate below is what keeps the core light: importing this subpackage without
-the extra installed must say so, rather than failing later with a bare
-``No module named 'openai'`` from three frames down.
-
-``stream`` and ``complete_with_tools`` are v0.2; only ``complete`` ships in v0.1.
-"""
+"""facade. The chat route's surface, gated on the 'llm' extra."""
 
 try:
-    import openai  # noqa: F401
-except ImportError as exc:  # pragma: no cover - exercised by the T11 wheel check
+    import openai
+except ImportError as exc:
     raise ImportError(
         "agent_toolkit.llm needs the optional 'llm' extra: "
         "pip install 'agent-toolkit[llm]'"
@@ -26,42 +19,40 @@ from agent_toolkit.llm.config import (
     set_config_resolver,
 )
 from agent_toolkit.llm.executors import Completion
-from agent_toolkit.llm.factory import complete, complete_with_reasoning
+from agent_toolkit.llm.factory import (
+    DEFAULT_EXPONENTIAL_BACKOFF,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_RETRY_DELAY,
+    complete,
+    complete_with_reasoning,
+)
 from agent_toolkit.llm.model_meta import (
     count_tokens,
     model_family,
     supports_native_tool_calling,
     supports_reasoning,
 )
-from agent_toolkit.llm.retry import (
-    RetryPolicy,
-    get_default_retry_policy,
-    set_default_retry_policy,
-)
-from agent_toolkit.llm.structured import ValidationInfo, complete_structured
 from agent_toolkit.llm.traffic_control import TrafficController, get_traffic_controller
 
 __all__ = [
+    "DEFAULT_EXPONENTIAL_BACKOFF",
+    "DEFAULT_MAX_RETRIES",
+    "DEFAULT_RETRY_DELAY",
     "Completion",
     "ConfigResolver",
     "DictConfigResolver",
     "EnvConfigResolver",
     "JsonDirConfigResolver",
     "LLMConfig",
-    "RetryPolicy",
     "TrafficController",
-    "ValidationInfo",
     "YamlConfigResolver",
     "complete",
-    "complete_structured",
     "complete_with_reasoning",
     "count_tokens",
-    "get_default_retry_policy",
     "get_traffic_controller",
     "model_family",
     "resolve_config",
     "set_config_resolver",
-    "set_default_retry_policy",
     "supports_native_tool_calling",
     "supports_reasoning",
 ]

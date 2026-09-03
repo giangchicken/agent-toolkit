@@ -1,30 +1,4 @@
-"""String helpers: slot filling, JSON extraction, normalization, hashing, and
-rule-based detection of the personal data a transcript carries.
-
-``slot_filling`` and ``extract_json_from_text`` are harvested from
-``agent-evaluation``'s ``src/utils/string_utils.py``, which was itself a
-toolkit-free copy of the originals. Behavior is preserved: ``json_repair``-based
-parsing, a code-fence scan, a first/last brace then bracket scan, then a
-nested-candidate sweep. ``normalize_text`` and ``compute_hash`` come from
-``voice-agent-toolkit``.
-
-Both extraction functions log at debug and return a fallback rather than raising,
-on any input. That contract is deliberate: they parse model output, which is
-adversarial by nature, and a caller mid-pipeline should get an empty result it
-can record rather than an exception it has to catch at every call site.
-
-The ``*_detection_by_rules`` functions are one scan each -- a phone number, an
-email address, an OTP, a name -- rather than one scan for "PII", because the
-kinds have nothing in common at a call site: a pipeline redacts a phone number
-and keeps a name, or the reverse, and each rule is wrong in its own way. Each
-finds both the written form and the form a speaker dictates -- ``0912345678`` and
-``không chín một hai ...`` -- from a table of the words that language reads a
-digit, an ``@`` or a name aloud with.
-
-``by_rules`` is in the name because a rule is not the only way to find these --
-a model reading a bounded window is the other, it belongs to whoever holds the
-model, and the two want telling apart at a call site.
-"""
+"""logic. The decisions taken over the tables in :mod:`agent_toolkit.lexicon`."""
 
 import hashlib
 import json
@@ -35,18 +9,20 @@ from typing import Any
 
 import json_repair
 
+from agent_toolkit.lexicon import (
+    NAME_TITLES,
+    OTP_CUES,
+    SPACE_UNICODES,
+    SPOKEN_AT,
+    SPOKEN_DIGITS,
+    SPOKEN_DOT,
+    THINKING_MARKERS,
+)
 from agent_toolkit.logging import get_logger
 
 logger = get_logger(__name__)
 
 __all__ = [
-    "NAME_TITLES",
-    "OTP_CUES",
-    "SPOKEN_AT",
-    "SPOKEN_DIGITS",
-    "SPOKEN_DOT",
-    "THINKING_MARKERS",
-    "clean_thinking_tags",
     "compute_hash",
     "email_detection_by_rules",
     "extract_json_from_text",
@@ -58,22 +34,11 @@ __all__ = [
     "split_thinking",
 ]
 
-# Narrow no-break space, no-break space, thin space. Written as escapes
-# because all three are visually indistinguishable from U+0020 in source.
-SPACE_UNICODES = ["\u202f", "\u00a0", "\u2009"]
 
-# Each pass of slot_filling resolves at least one level of nesting, and the
-# design it serves is two-level, so this is roughly fifty times the depth any
-# real template needs. It exists to bound one case the upstream fixpoint loop
-# does not terminate on: mutually referential placeholders. {"a": "{{b}}",
-# "b": "{{a}}"} changes the text on every pass, so the `text == old_text` check
-# never fires and the loop spins forever. Direct self-reference is fine -- the
-# replacement is a no-op, so the fixpoint check catches it on the first pass.
 MAX_SLOT_FILLING_PASSES = 100
 
 
 def compute_hash(content: str, hash_type: str = "sha256") -> str:
-    """Return a hex digest of ``content``. Unknown ``hash_type`` means sha256."""
     if hash_type == "md5":
         return hashlib.md5(content.encode("utf-8")).hexdigest()
     elif hash_type == "sha1":
@@ -85,13 +50,6 @@ def compute_hash(content: str, hash_type: str = "sha256") -> str:
 
 
 def normalize_text(text: str, remove_tone_marks: bool = False) -> str:
-    """NFKC-normalize ``text``, fold unusual spaces, and collapse whitespace.
-
-    Digits separated by a narrow or non-breaking space are joined rather than
-    space-separated, so "1 234" written with U+202F becomes "1234".
-    ``remove_tone_marks`` strips Unicode combining marks, which for Vietnamese
-    means dropping diacritics -- useful as a dedup key, lossy as a display form.
-    """
     try:
         for unicode_space in SPACE_UNICODES:
             if unicode_space in text:
@@ -99,9 +57,6 @@ def normalize_text(text: str, remove_tone_marks: bool = False) -> str:
                 text = text.replace(unicode_space, " ")
         text = unicodedata.normalize("NFKC", text)
         if remove_tone_marks:
-            # Decompose first. The harvested version filtered combining marks
-            # straight after NFKC, but NFKC *recomposes*, so for Vietnamese there
-            # were no Mn characters left to find and the flag did nothing at all.
             text = unicodedata.normalize("NFD", text)
             text = "".join(c for c in text if unicodedata.category(c) != "Mn")
             text = unicodedata.normalize("NFC", text)
@@ -117,16 +72,6 @@ def slot_filling(
     key_value_mapping: dict[str, Any] | None = None,
     object_dict: dict[str, Any] | None = None,
 ) -> str:
-    """Substitute ``{{placeholder}}`` tokens until the text stops changing.
-
-    A value that itself contains ``{{other}}`` is resolved on a later pass, so
-    nested placeholders fill correctly. ``object_dict`` values are read from a
-    ``{"value": ...}`` wrapper; ``key_value_mapping`` values are used directly.
-    Unknown placeholders are left untouched.
-
-    Gives up after ``MAX_SLOT_FILLING_PASSES`` passes and returns the text as it
-    stands, which bounds mutually referential placeholders.
-    """
     try:
         no_change = False
         passes = 0
@@ -165,17 +110,6 @@ def slot_filling(
 
 
 def _spans_one_structure(span: str) -> bool:
-    """True if ``span`` is a single brace/bracket structure rather than two.
-
-    The first-brace-to-last-brace scan below can select a span covering two
-    disjoint objects -- ``{"a": 1} and then {"b": 2}`` -- which a repair parser
-    will happily turn into a single value, swallowing both and reporting one.
-    This guard rejects that span so it falls through to the candidate sweep,
-    which finds the two objects separately.
-
-    Depth is counted with string contents skipped, so a brace inside a JSON
-    string value cannot throw off the count.
-    """
     depth = 0
     in_string = False
     escaped = False
@@ -200,15 +134,6 @@ def _spans_one_structure(span: str) -> bool:
 
 
 def _parse_json_candidate(json_text: str) -> dict[str, Any] | list[Any] | None:
-    """Parse one candidate, discarding a repair that changed the structure's type.
-
-    ``json_repair`` turns ``{invalid json here}`` into ``["invalid json here}"]``
-    -- a list invented from something that opened as an object. For a caller
-    recording model votes that is worse than no result at all, because the
-    garbage arrives looking like a real answer. So a candidate opening with
-    ``{`` must parse to a dict and one opening with ``[`` must parse to a list,
-    or it is discarded.
-    """
     stripped = json_text.lstrip()
     try:
         parsed = json_repair.loads(json_text)
@@ -224,14 +149,6 @@ def _parse_json_candidate(json_text: str) -> dict[str, Any] | list[Any] | None:
 def extract_json_from_text(
     text: str, extract_all: bool = False
 ) -> dict[str, Any] | list[Any] | None:
-    """Extract the first JSON value from ``text`` (or all, if ``extract_all``).
-
-    Scan order: ```json fenced blocks, then the outer first/last brace object,
-    then the outer first/last bracket array, then a sweep of nested
-    brace/bracket candidates. Parsing uses ``json_repair`` to tolerate minor
-    malformation. Returns the parsed ``dict``/``list``, a list of them when
-    ``extract_all`` is set, or ``None`` when nothing parses.
-    """
     try:
         json_objects: list[Any] = []
         used_positions: set[int] = set()
@@ -316,74 +233,7 @@ def extract_json_from_text(
         return None
 
 
-def clean_thinking_tags(
-    content: str,
-    binding: str | None = None,
-    model: str | None = None,
-) -> str:
-    """Remove ``<think>`` blocks from model output.
-
-    ``binding`` and ``model`` are accepted and ignored. They are part of the
-    signature at the harvested call sites, and keeping them is what makes the
-    ``agent-evaluation`` migration an import-line change.
-
-    Frozen at the harvested behavior, which means it only removes a *well-formed*
-    ``<think>...</think>`` pair. Two shapes real models produce survive it whole:
-    a chat template that pre-fills the opening tag, so only ``</think>`` is in the
-    response, and a block cut off by ``max_tokens``, so only ``<think>`` is. Use
-    :func:`split_thinking` for those -- and for the reasoning text itself, which
-    this function discards.
-    """
-    if not content:
-        return ""
-
-    pattern = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-    cleaned = re.sub(pattern, "", content)
-    return cleaned.strip()
-
-
-# Reasoning wrappers, in match order. Harvested from ``voice-agent-toolkit``'s
-# ``REASONING_TOKEN_PAIRS`` minus ``("<step>", "</step>")``: that is the one pair
-# a model plausibly emits *inside an answer* -- enumerating steps -- and the
-# end-token rule below would then read the whole answer up to it as reasoning.
-THINKING_MARKERS: list[tuple[str, str]] = [
-    ("<think>", "</think>"),
-    ("<reasoning>", "</reasoning>"),
-    ("<thought>", "</thought>"),
-    ("<internal>", "</internal>"),
-    ("<scratchpad>", "</scratchpad>"),
-    ("[think]", "[/think]"),
-    ("[reasoning]", "[/reasoning]"),
-    ("[thought]", "[/thought]"),
-]
-
-
 def split_thinking(text: str) -> tuple[str, str]:
-    """Split ``text`` into ``(reasoning, answer)`` on the first reasoning marker.
-
-    The rule is one line: **everything up to and including the first end marker is
-    reasoning, and everything after it is the answer.** That covers the three
-    shapes a reasoning model actually returns, including the two
-    :func:`clean_thinking_tags` misses:
-
-    - ``<think>why</think>answer`` -> ``("<think>why</think>", "answer")``
-    - ``why</think>answer`` -> the same, for a chat template that pre-filled the
-      opening tag. Most vLLM deployments of Qwen3 and DeepSeek-R1 do this, so the
-      response has no opening tag at all.
-    - ``<think>why`` (cut off by ``max_tokens``) -> ``("<think>why", "")``. An
-      empty answer is the honest result: the model never reached one.
-
-    Text with no marker comes back as ``("", text)``, so this is safe to call on
-    every response.
-
-    Markers are kept in the reasoning, matched case-insensitively, and only the
-    *first* end marker splits -- a second ``</think>`` stays in the answer, where
-    a caller can see it, rather than silently eating everything up to it.
-
-    Prose before an opening marker is counted as reasoning, because the pre-filled
-    shape above makes that case indistinguishable from reasoning that simply did
-    not open with a tag.
-    """
     if not text:
         return "", ""
 
@@ -399,39 +249,7 @@ def split_thinking(text: str) -> tuple[str, str]:
     return "", text
 
 
-SPOKEN_DIGITS: dict[str, str] = {
-    # Vietnamese says three digits two ways -- một/mốt, bốn/tư, năm/lăm -- which
-    # is why a row is a set of words and not ten entries indexed by value.
-    "vi": r"khong|không|chin|chín|bay|bon|bảy|bốn|hai|lam|lăm|mot|mốt|một|nam|năm|sau|sáu|tam|tám|ba|tu|tư",
-    "en": r"eight|seven|three|five|four|nine|zero|one|six|two|oh",
-}
-
-SPOKEN_AT: dict[str, str] = {"vi": r"a\s+cong|a\s+còng|a\s+moc|a\s+móc|at", "en": r"at"}
-SPOKEN_DOT: dict[str, str] = {"vi": r"cham|chấm|dot", "en": r"point|dot"}
-
-NAME_TITLES: dict[str, str] = {
-    "vi": r"ten\s+toi\s+la|tên\s+tôi\s+là|toi\s+ten|tôi\s+tên|anh|bac|bác|chi|chu|chú|chị|ong|ten|tên|ông|ba|bà|co|cô|em",
-    "en": r"my\s+name\s+is|customer|i\s+am|miss|mrs|dr|mr|ms",
-}
-
-OTP_CUES: dict[str, str] = {
-    "vi": r"ma\s+xac\s+nhan|ma\s+xac\s+thuc|mã\s+xác\s+nhận|mã\s+xác\s+thực|ma\s+bao\s+mat|mã\s+bảo\s+mật|ma\s+otp|ma\s+pin|mã\s+otp|mã\s+pin|otp",
-    "en": r"one\s+time\s+password|verification\s+code|security\s+code|otp|pin",
-}
-
-
 def phone_number_detection_by_rules(text: str, language: str = "vi") -> list[str]:
-    """Phone numbers in ``text``, in document order, written or dictated.
-
-    Written is nine to eleven digits, so ``0912 345 678``, ``0912.345.678`` and
-    ``+84912345678`` all match; a longer run is not a phone number and a shorter
-    one is an OTP or a house number. Dictated is a run of that many digit words
-    -- ``không chín một hai ba bốn năm sáu bảy tám``.
-
-    Recall-first: a Vietnamese digit word is also an ordinary word, so a long
-    enough run of ``ba``, ``tư`` and ``năm`` in prose will match. Cheap to filter
-    downstream, expensive to miss.
-    """
     said = SPOKEN_DIGITS[language]
     return re.findall(
         r"(?<!\w)\+?\d(?:[\s.-]?\d){8,10}(?!\w)"
@@ -442,18 +260,6 @@ def phone_number_detection_by_rules(text: str, language: str = "vi") -> list[str
 
 
 def email_detection_by_rules(text: str, language: str = "vi") -> list[str]:
-    """Email addresses in ``text``, in document order, written or dictated.
-
-    The written shape is a fact about a format rather than about a corpus, so it
-    needs no vocabulary; the dictated one -- ``dung chấm mtk a còng gmail chấm
-    com`` -- needs the words for ``@`` and ``.``.
-
-    The domain ends a dictated match exactly, because the spoken ``.`` marks every
-    label boundary. Where the local part *begins* is not knowable from the words --
-    nothing tells ``là dung chấm mtk`` apart from the address itself -- so the rule
-    takes up to four words before the ``@``: it over-captures a filler word and
-    under-captures no address.
-    """
     at, dot = SPOKEN_AT[language], SPOKEN_DOT[language]
     return re.findall(
         r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"
@@ -465,13 +271,6 @@ def email_detection_by_rules(text: str, language: str = "vi") -> list[str]:
 
 
 def otp_detection_by_rules(text: str, language: str = "vi") -> list[str]:
-    """One-time codes in ``text``, in document order.
-
-    Four to eight digits, written or dictated, and only when a cue word puts one
-    there: a bare ``123456`` is an order number as often as a code, and a scan
-    that claimed it would flag every invoice in the corpus. The cue is dropped
-    from the result -- what a caller redacts is the code.
-    """
     cue, said = OTP_CUES[language], SPOKEN_DIGITS[language]
     return re.findall(
         rf"(?:{cue}).{{0,20}}?"
@@ -482,21 +281,9 @@ def otp_detection_by_rules(text: str, language: str = "vi") -> list[str]:
 
 
 def name_detection_by_rules(text: str, language: str = "vi") -> list[str]:
-    """Personal names in ``text``, in document order, by the one rule that needs
-    no list of names: a title or an introduction, then the capitalised words
-    after it.
-
-    So ``anh Nguyễn Văn Dũng`` and ``my name is Dung`` are found, and a name
-    nobody announced is not -- that one wants a model reading a window, not a
-    rule. Capitalisation is what ends a name, which is why ``chị ấy nói`` yields
-    nothing rather than yielding ``ấy nói``.
-    """
     title = NAME_TITLES[language]
     names = []
     for cue in re.finditer(rf"(?<!\w)(?:{title})[\s,.:]+", text, re.IGNORECASE):
-        # Scanning for the title alone and reading the words after it in Python,
-        # rather than capturing them: a regex cannot say "an uppercase letter"
-        # for Vietnamese, whose precomposed vowels interleave the two cases.
         after = re.findall(r"[^\W\d_]+", text[cue.end() : cue.end() + 60])[:4]
         found = " ".join(takewhile(lambda word: word[:1].isupper(), after))
         if found:

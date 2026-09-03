@@ -1,4 +1,4 @@
-"""logic. How many requests may be in flight, and how often."""
+"""logic. This route's own concurrency and rate budget."""
 
 import asyncio
 import time
@@ -15,7 +15,7 @@ __all__ = ["TrafficController", "get_traffic_controller"]
 class TrafficController:
     def __init__(
         self,
-        provider_name: str = "llm",
+        provider_name: str = "embed",
         max_concurrency: int = 5,
         requests_per_minute: int = 30,
         acquisition_timeout: float = 120.0,

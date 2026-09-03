@@ -1,12 +1,12 @@
-"""adapter. Env, JSON and YAML translated into one call's settings."""
+"""adapter. Env, JSON and YAML translated into one embeddings call's settings."""
 
 import os
 import pathlib
 from dataclasses import dataclass, fields, replace
 from typing import Any, Protocol
 
+from agent_toolkit.embed.exceptions import EmbedConfigError
 from agent_toolkit.file_utils import read_json, read_yaml
-from agent_toolkit.llm.exceptions import LLMConfigError
 from agent_toolkit.logging import get_logger
 
 logger = get_logger(__name__)
@@ -14,9 +14,9 @@ logger = get_logger(__name__)
 __all__ = [
     "ConfigResolver",
     "DictConfigResolver",
+    "EmbedConfig",
     "EnvConfigResolver",
     "JsonDirConfigResolver",
-    "LLMConfig",
     "YamlConfigResolver",
     "resolve_config",
     "set_config_resolver",
@@ -24,24 +24,18 @@ __all__ = [
 
 
 @dataclass
-class LLMConfig:
+class EmbedConfig:
     model: str
     api_key: str = ""
     base_url: str | None = None
-    api_version: str | None = None
     binding: str = "openai"
     extra_headers: dict[str, str] | None = None
-    reasoning_effort: str | None = None
-    enable_thinking: bool | None = None
-    max_tokens: int = 4096
-    temperature: float = 0.7
-    top_p: float | None = None
     timeout: float = 120.0
     max_concurrency: int = 20
     requests_per_minute: int = 600
 
 
-_FIELD_NAMES = frozenset(field.name for field in fields(LLMConfig))
+_FIELD_NAMES = frozenset(field.name for field in fields(EmbedConfig))
 
 _CALLER_SUPPLIED = ("api_key", "base_url")
 
@@ -49,37 +43,37 @@ _YAML_KEYS = _FIELD_NAMES - set(_CALLER_SUPPLIED)
 
 
 class ConfigResolver(Protocol):
-    def resolve(self, model: str | None) -> LLMConfig: ...
+    def resolve(self, model: str | None) -> EmbedConfig: ...
 
 
 class EnvConfigResolver:
-    def resolve(self, model: str | None) -> LLMConfig:
-        resolved = model or os.environ.get("LLM_MODEL") or ""
+    def resolve(self, model: str | None) -> EmbedConfig:
+        resolved = model or os.environ.get("EMBED_MODEL") or ""
         if not resolved:
-            raise LLMConfigError(
-                "no model: pass model=..., set LLM_MODEL, "
-                "or install a resolver with set_config_resolver()"
+            raise EmbedConfigError(
+                "no embeddings model: pass model=..., set EMBED_MODEL, "
+                "or install a resolver with agent_toolkit.embed.set_config_resolver()"
             )
-        return LLMConfig(
+        return EmbedConfig(
             model=resolved,
-            api_key=os.environ.get("LLM_API_KEY", ""),
-            base_url=os.environ.get("LLM_BASE_URL"),
+            api_key=os.environ.get("EMBED_API_KEY", ""),
+            base_url=os.environ.get("EMBED_BASE_URL"),
         )
 
 
 class DictConfigResolver:
-    def __init__(self, configs: dict[str, LLMConfig]) -> None:
+    def __init__(self, configs: dict[str, EmbedConfig]) -> None:
         self._configs = dict(configs)
 
-    def resolve(self, model: str | None) -> LLMConfig:
+    def resolve(self, model: str | None) -> EmbedConfig:
         if model is None:
-            raise LLMConfigError(
+            raise EmbedConfigError(
                 f"a model name is required; known models: {sorted(self._configs)}"
             )
         try:
             return self._configs[model]
         except KeyError:
-            raise LLMConfigError(
+            raise EmbedConfigError(
                 f"no config for model {model!r}; known models: {sorted(self._configs)}"
             ) from None
 
@@ -88,50 +82,50 @@ class JsonDirConfigResolver:
     def __init__(self, directory: str | os.PathLike[str]) -> None:
         self._directory = pathlib.Path(directory)
 
-    def resolve(self, model: str | None) -> LLMConfig:
+    def resolve(self, model: str | None) -> EmbedConfig:
         if model is None:
-            raise LLMConfigError("a model name is required to choose a config file")
+            raise EmbedConfigError("a model name is required to choose a config file")
         name = model.strip()
         path = self._directory / (name.lower().replace(" ", "_") + ".json")
         raw = read_json(path)
         if not isinstance(raw, dict) or not raw:
-            raise LLMConfigError(f"no usable LLM config at {path}")
+            raise EmbedConfigError(f"no usable embeddings config at {path}")
 
         known: dict[str, Any] = {
             key: value for key, value in raw.items() if key in _FIELD_NAMES
         }
         known.setdefault("model", name)
-        return LLMConfig(**known)
+        return EmbedConfig(**known)
 
 
 class YamlConfigResolver(DictConfigResolver):
     def __init__(self, path: str | os.PathLike[str]) -> None:
         raw = read_yaml(path)
         if not isinstance(raw, dict) or not raw:
-            raise LLMConfigError(f"no usable LLM config at {path}")
+            raise EmbedConfigError(f"no usable embeddings config at {path}")
 
         defaults = raw.get("defaults") or {}
         if not isinstance(defaults, dict):
-            raise LLMConfigError(f"{path}: 'defaults' must be a mapping")
+            raise EmbedConfigError(f"{path}: 'defaults' must be a mapping")
         _reject_unsettable(defaults, path=path, where="defaults")
 
         models = raw.get("models")
         if not isinstance(models, dict) or not models:
-            raise LLMConfigError(f"{path}: no 'models' block, or it is empty")
+            raise EmbedConfigError(f"{path}: no 'models' block, or it is empty")
 
-        configs: dict[str, LLMConfig] = {}
+        configs: dict[str, EmbedConfig] = {}
         for name, settings in models.items():
             if settings is None:
                 settings = {}
             if not isinstance(settings, dict):
-                raise LLMConfigError(f"{path}: model {name!r} must be a mapping")
+                raise EmbedConfigError(f"{path}: model {name!r} must be a mapping")
             _reject_unsettable(settings, path=path, where=f"model {name!r}")
             merged: dict[str, Any] = {**defaults, **settings}
             merged.setdefault("model", name)
             try:
-                configs[str(name)] = LLMConfig(**merged)
+                configs[str(name)] = EmbedConfig(**merged)
             except TypeError as exc:
-                raise LLMConfigError(f"{path}: model {name!r}: {exc}") from exc
+                raise EmbedConfigError(f"{path}: model {name!r}: {exc}") from exc
 
         super().__init__(configs)
 
@@ -139,14 +133,14 @@ class YamlConfigResolver(DictConfigResolver):
 def _reject_unsettable(settings: dict[Any, Any], *, path: Any, where: str) -> None:
     for key in _CALLER_SUPPLIED:
         if key in settings:
-            raise LLMConfigError(
+            raise EmbedConfigError(
                 f"{path}: {where} sets {key!r}; this file says how a model "
                 f"behaves, not where it runs or what authenticates it. "
-                f"Pass {key}=... to complete() or resolve_config()"
+                f"Pass {key}=... to vectors() or resolve_config()"
             )
     unknown = sorted(str(key) for key in settings if key not in _YAML_KEYS)
     if unknown:
-        raise LLMConfigError(
+        raise EmbedConfigError(
             f"{path}: {where} has unknown setting(s) {unknown}; "
             f"settable: {sorted(_YAML_KEYS)}"
         )
@@ -165,11 +159,9 @@ def resolve_config(
     model: str | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
-    api_version: str | None = None,
     binding: str | None = None,
     extra_headers: dict[str, str] | None = None,
-    reasoning_effort: str | None = None,
-) -> LLMConfig:
+) -> EmbedConfig:
     resolver = _resolver if _resolver is not None else EnvConfigResolver()
     config = resolver.resolve(model)
     logger.debug(
@@ -189,12 +181,6 @@ def resolve_config(
         config,
         api_key=api_key if api_key is not None else config.api_key,
         base_url=base_url or config.base_url,
-        api_version=api_version or config.api_version,
         binding=binding or config.binding or "openai",
         extra_headers=headers,
-        reasoning_effort=(
-            reasoning_effort
-            if reasoning_effort is not None
-            else config.reasoning_effort
-        ),
     )

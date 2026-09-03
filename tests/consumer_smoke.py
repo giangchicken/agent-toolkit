@@ -42,7 +42,6 @@ CONTRACT = frozenset(
         "LLMError hierarchy",
         "TrafficController",
         "complete",
-        "complete_structured",
         "compute_hash",
         "count_tokens",
         "extract_json_from_text",
@@ -183,12 +182,10 @@ def check_llm(base_url: str) -> None:
     from agent_toolkit.llm import (
         TrafficController,
         complete,
-        complete_structured,
         count_tokens,
         model_family,
     )
     from agent_toolkit.llm.exceptions import LLMAPIError, LLMError
-    from agent_toolkit.llm.retry import RetryPolicy
 
     # What the jury uses it for: distinct families, counted.
     check(
@@ -216,26 +213,6 @@ def check_llm(base_url: str) -> None:
         "Xin chào!",
     )
 
-    _Stub.reply = 'Vote:\n```json\n["get_weather"]\n```'
-    schema = {
-        "type": "array",
-        "items": {"type": "string", "enum": ["get_weather", "book_flight"]},
-    }
-    value, info = asyncio.run(
-        complete_structured(
-            "Which tool?",
-            schema,
-            model="stub-model",
-            base_url=base_url,
-            api_key="none",
-        )
-    )
-    check(
-        "complete_structured",
-        (value, info.ok, info.repaired),
-        (["get_weather"], True, True),
-    )
-
     # The hierarchy as a consumer meets it: one `except LLMError` around the call.
     try:
         asyncio.run(
@@ -244,7 +221,7 @@ def check_llm(base_url: str) -> None:
                 model="stub-model",
                 base_url=f"http://127.0.0.1:{closed_port()}/v1",
                 api_key="none",
-                retry=RetryPolicy(max_retries=0),
+                max_retries=0,
             )
         )
     except LLMError as exc:

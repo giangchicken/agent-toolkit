@@ -1,6 +1,6 @@
 # agent-toolkit
 
-Shared utilities for agent and dataset pipelines: string, JSON, and file helpers, plus an OpenAI-compatible LLM client with retry, rate limiting, and validated structured output.
+Shared utilities for agent and dataset pipelines: string, JSON, and file helpers, plus an OpenAI-compatible LLM client with retry and rate limiting.
 
 Spec: [`docs/spec.md`](docs/spec.md). Plan: [`docs/plan.md`](docs/plan.md).
 
@@ -63,7 +63,7 @@ uv add --editable "/path/to/agent-toolkit[llm]"
 
 ### Checking the install
 
-`tests/consumer_smoke.py` calls each of the fifteen symbols a consumer imports, against whatever `agent_toolkit` is on the path. It needs no network beyond a localhost socket, because the two LLM entry points talk to a stub `http.server` it starts itself. Run it inside your own environment to confirm the dependency resolved to something that works:
+`tests/consumer_smoke.py` calls each of the fourteen symbols a consumer imports, against whatever `agent_toolkit` is on the path. It needs no network beyond a localhost socket, because the two LLM entry points talk to a stub `http.server` it starts itself. Run it inside your own environment to confirm the dependency resolved to something that works:
 
 ```bash
 git clone --depth 1 -b v0.1.0 https://github.com/giangchicken/agent-toolkit.git /tmp/at
@@ -74,6 +74,8 @@ python /tmp/at/tests/consumer_smoke.py
 It prints one line per symbol and exits non-zero on the first that misbehaves. Note that it is not in the wheel — wheels carry `src/agent_toolkit` only — so it comes from a checkout or from the sdist.
 
 ## string_utils
+
+The tables these read — `THINKING_MARKERS`, `SPOKEN_DIGITS`, `SPOKEN_AT`, `SPOKEN_DOT`, `NAME_TITLES`, `OTP_CUES`, `SPACE_UNICODES` — live in `agent_toolkit.lexicon`, a `shape` module that imports nothing, so a host can read or extend a language table without importing the rules over it.
 
 ```python
 from agent_toolkit.string_utils import (
@@ -93,12 +95,10 @@ compute_hash("dataforce")  # sha256 hex digest
 extract_json_from_text('Vote:\n```json\n["get_weather"]\n```')  # ['get_weather']
 
 # Reasoning and answer, separated. Handles a chat template that pre-filled the
-# opening tag and a block that max_tokens cut off, which clean_thinking_tags does not.
+# opening tag and a block that max_tokens cut off, which a two-tag regex does not.
 split_thinking("Chào hỏi thôi.</think>Xin chào!")
 # ('Chào hỏi thôi.</think>', 'Xin chào!')
 ```
-
-`clean_thinking_tags` is also exported, unchanged from `voice-agent-toolkit`, for call sites being migrated. New code should use `split_thinking`.
 
 ## json_utils and file_utils
 
@@ -213,32 +213,18 @@ Unknown keys raise too, at load time rather than at the first call — this is o
 
 `max_tokens`, `temperature`, `top_p`, `timeout`, `enable_thinking`, `max_concurrency`, and `requests_per_minute` are read off the resolved `LLMConfig`, so a resolver can set them per model. `top_p` and `enable_thinking` are sent only when something sets them; `timeout` configures the HTTP client rather than the request body.
 
-### Structured output
-
-`complete_structured` validates against the schema whichever way the JSON was produced, and returns the reason when it does not conform instead of a half-parsed value.
-
-```python
-from agent_toolkit.llm import complete_structured
-
-schema = {"type": "array", "items": {"type": "string", "enum": catalog}}
-value, info = await complete_structured(prompt, schema, model="gemma-4-31B-it")
-
-if info.ok:
-    use(value)  # validated against `schema`
-else:
-    abstain(info.error)  # e.g. "$[1]: 'delete_database' is not one of [...]"
-```
-
-`mode` picks how the constraint is applied: `"auto"` (default) tries the OpenAI `response_format` and falls back to a prompt instruction, `"grammar"` uses vLLM's `guided_json`, `"prompt"` only asks. A decode-time constraint removes *detectable* invalid output, not invalid output — the module docstring records a measured case where it made the answer worse — so validation runs either way.
-
 ### Errors, retry, and traffic
 
 ```python
-from agent_toolkit.llm import RetryPolicy, TrafficController, set_default_retry_policy
+from agent_toolkit.llm import TrafficController
 from agent_toolkit.llm.exceptions import LLMError, LLMRateLimitError, LLMTimeoutError
 
-set_default_retry_policy(RetryPolicy(max_retries=3, base_delay=1.0))
+await complete(prompt=..., model=..., max_retries=1, retry_delay=0.0)
 ```
+
+Retry is configured per call, by the three keywords `agent-evaluation`'s `complete()` takes: `max_retries` (default 8), `retry_delay` (5.0 seconds, and the multiplier when backoff is exponential), and `exponential_backoff` (True). They are named parameters, so they configure the retry rather than falling through `**kwargs` into the request body, and each attempt waits `retry_delay * 2 ** (n - 1)` capped at two minutes.
+
+The three defaults are module constants — `DEFAULT_MAX_RETRIES`, `DEFAULT_RETRY_DELAY`, `DEFAULT_EXPONENTIAL_BACKOFF` on `agent_toolkit.llm.factory`, importable from `agent_toolkit.llm`. They are bound into the signatures at import, as in the harvested code, so reassigning one later does not change an unset keyword; pass the keyword at the call site, which always wins.
 
 Every provider failure arrives as a subclass of `LLMError`, so one `except LLMError` around a call is enough. Timeouts, 429s, 5xx, and connection drops are retried; authentication, configuration, and other 4xx fail immediately.
 
@@ -266,9 +252,48 @@ count_tokens(messages, "gpt-4o")
 
 `count_tokens` estimates with tiktoken and is **rough** — measured drift against a real endpoint runs from −33% to +64% on Vietnamese. Size a request with it; account for what it cost with the `usage` the response reports. It fetches its vocabulary over the network on first use unless `TIKTOKEN_CACHE_DIR` points at a populated cache.
 
+## embed
+
+```python
+from agent_toolkit.embed import vectors
+
+rows = await vectors(["câu thứ nhất", "câu thứ hai"], model="bge-m3")
+```
+
+One vector per text, in the order the texts were given — paired by the response's `index`, not by arrival order, because a mis-paired vector is not something anything downstream of it can detect. `batch_size=` splits one call into several requests dispatched concurrently under the model's own concurrency budget; left unset, one request carries every text. A provider that answers with fewer rows than it was asked about raises `EmbedProviderError` rather than returning a shifted list.
+
+`agent_toolkit.embed` mirrors `agent_toolkit.llm` module for module — its own `config.py`, `exceptions.py`, `error_mapping.py`, `traffic_control.py`, `executors.py`, `factory.py` — and three consequences follow from that:
+
+- **Its own resolver.** `agent_toolkit.embed.set_config_resolver()` is a different process-wide slot from the chat route's. A host that configures both installs one on each; installing a resolver on `agent_toolkit.llm` leaves `vectors()` on `EMBED_MODEL` / `EMBED_API_KEY` / `EMBED_BASE_URL`.
+- **Its own traffic budget.** `agent_toolkit.embed.get_traffic_controller("m")` and `agent_toolkit.llm.get_traffic_controller("m")` are two controllers, so a model called from both routes is throttled once per route rather than once in total.
+- **Its own error taxonomy.** `vectors` raises `EmbedError` subclasses, never `LLMError` ones. A host that wrapped both routes in one `except LLMError` needs a second clause after this.
+
+`EmbedConfig` carries only what an embeddings call needs — `model`, `api_key`, `base_url`, `binding`, `extra_headers`, `timeout`, `max_concurrency`, `requests_per_minute`. It has no `max_tokens`, `temperature`, `top_p`, `reasoning_effort`, `enable_thinking` or `api_version`: those are the body of the chat route, and a field here would be a number a resolver could set and this route would never send. The four resolvers and the precedence rule are the chat route's, unchanged, and a YAML file naming a chat-only setting raises rather than ignoring it.
+
+```python
+from agent_toolkit.embed.exceptions import EmbedError, EmbedInputTooLargeError
+```
+
+`agent_toolkit.embed.exceptions` is ten classes under `EmbedError`, shaped like the chat route's twelve and named for this route: `EmbedConfigError`, `EmbedProviderError`, `EmbedAPIError` and its four status-carrying children, `EmbedQuotaExceededError`, and `EmbedInputTooLargeError`. There is no parse error and no circuit breaker — nothing here reads a model's prose.
+
+Two things follow from the taxonomy being this route's own rather than the chat route's. `EmbedInputTooLargeError` means *one text over the model's token limit*, which is a length the caller fixes by chunking, so it is **not retried** — where the chat route's `ProviderContextWindowError` sets no status code, falls through to the catch-all, and spends the whole backoff schedule on a certainty. And the retry defaults are `agent_toolkit.embed.factory`'s own constants — `DEFAULT_MAX_RETRIES` / `DEFAULT_RETRY_DELAY` / `DEFAULT_EXPONENTIAL_BACKOFF`, importable from `agent_toolkit.embed`, same values and same three keywords per call — so tuning one route's retry no longer moves the other's.
+
 ## Logging
 
-`get_logger(__name__)` returns a standard library logger and does nothing else. The library adds no handler and sets no level, so a host that configures nothing sees nothing.
+`get_logger(__name__)` returns a standard library logger and does nothing else. The library adds no handler and sets no level, so a host that configures nothing sees nothing. Every module logs through it: the config resolver's answer, each call's model and endpoint, and failures — all on the `agent_toolkit` logger tree, at `DEBUG` except warnings and errors.
+
+A host that wants to *see* those records configures the `agent_toolkit` logger itself, or calls `configure_logging()` for the console-and-file setup `agent-evaluation` uses:
+
+```python
+import agent_toolkit
+
+agent_toolkit.configure_logging("DEBUG", log_dir="logs")
+# [llm.factory] DEBUG: LLM call: model=glm-5.1 binding=openai base_url=... max_tokens=4096 ...
+# [llm.factory] DEBUG: LLM call ok in 1.83s: model=glm-5.1 content=412 chars reasoning=0 chars
+# [embed.factory] DEBUG: embeddings call ok in 0.21s: model=bge-m3 vectors=2 dimensions=1024
+```
+
+It installs a colored, level-tagged stderr handler and — when `log_dir` is given — a daily `agent_toolkit_YYYYMMDD.log` beneath it, both on the `agent_toolkit` logger. Nothing happens at import; the handlers appear only when the host calls it, it is idempotent (a second call replaces its own handlers and no one else's), and `propagate=False` by default keeps the records out of a host's root handlers. `console=False` gives file-only output, `colors=` forces the ANSI codes on or off, and `file_level=` sets the file's threshold independently of the console's.
 
 ## Not in 0.1
 
@@ -279,11 +304,11 @@ The spec's public surface lists these; they are not implemented, so importing th
 | `llm.stream` | No v0.1 consumer streams. It also needs the `TrafficController` fix its harvested caller depends on — `_wait_for_token()` does not exist, so every streaming call raised `AttributeError`. The fix ships with the feature. |
 | `llm.complete_with_tools`, `extract_tool_calls_from_text` | Jurors return JSON text, not tool calls. |
 | `json_utils.loads_repair`, `deep_merge`, `json_diff`, `jsonpath_get` | No v0.1 consumer. `iter_json_array` is the one the pipeline needs. |
-| Embeddings, Responses API conversion, a provider abstraction | The pipeline uses local static embeddings and one OpenAI-compatible path. |
+| Responses API conversion, a provider abstraction | One OpenAI-compatible path is what the pipeline calls. |
 | Full behavioural parity with `voice-agent-toolkit` 0.2.24, and the `agent-evaluation` migration | Parity exists to make that migration provably transparent. DataForce is greenfield and carries no parity obligation. |
 | Registry publishing, 3.11 and 3.14 wheels | The pipeline installs from a path or a git ref on 3.12. |
 
-Also known and unaddressed: `LLMRateLimitError.retry_after` is never populated from a `Retry-After` header, and `complete` discards the response's `usage`.
+Also known and unaddressed: `LLMRateLimitError.retry_after` is never populated from a `Retry-After` header, and `complete` discards the response's `usage` — so the call logs report elapsed time and response size, not tokens.
 
 ## Develop
 
@@ -302,7 +327,7 @@ AGENT_TOOLKIT_CORPUS=/path/to/array.json uv run pytest -q -k RealCorpus
 #   AGENT_TOOLKIT_CORPUS_COUNT=1000
 ```
 
-`tests/consumer_smoke.py` is not part of that suite. It checks the fifteen symbols the pipeline imports against an *installed wheel*, calling each one once, with the two LLM entry points pointed at a stub HTTP server. The unit tests all replace the transport, so this is the only check that the wheel works with its real resolved dependencies:
+`tests/consumer_smoke.py` is not part of that suite. It checks the fourteen symbols the pipeline imports against an *installed wheel*, calling each one once, with the two LLM entry points pointed at a stub HTTP server. The unit tests all replace the transport, so this is the only check that the wheel works with its real resolved dependencies:
 
 ```bash
 uv build
